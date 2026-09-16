@@ -42,11 +42,11 @@ train_jsonl = convert_to_openai_format(train_data)
 val_jsonl = convert_to_openai_format(val_data)
 
 # Write to files
-with open("train.jsonl", "w") as f:
+with open("../data/train.jsonl", "w") as f:
     for item in train_jsonl:
         f.write(json.dumps(item) + "\n")
 
-with open("val.jsonl", "w") as f:
+with open("../data/val.jsonl", "w") as f:
     for item in val_jsonl:
         f.write(json.dumps(item) + "\n")
 

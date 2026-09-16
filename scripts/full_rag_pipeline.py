@@ -214,7 +214,7 @@ Document: {top_doc}"""
 
 # ========== MAIN PIPELINE ==========
 if __name__ == "__main__":
-    with open("your_document.txt", "r") as f:
+    with open("../data/sample_corpus.txt", "r") as f:
         raw_text = f.read()
 
     chunks = recursive_split(raw_text, chunk_size=500, overlap=50)
