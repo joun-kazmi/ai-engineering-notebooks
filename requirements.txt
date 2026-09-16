@@ -1,0 +1,25 @@
+# LLM providers
+openai
+anthropic
+
+# Orchestration / agents
+langgraph
+langchain-core
+langchain-openai
+
+# Retrieval
+chromadb
+rank-bm25
+tiktoken
+numpy
+
+# Observability
+langfuse
+
+# Serving
+fastapi
+uvicorn
+pydantic
+
+# Reliability
+tenacity

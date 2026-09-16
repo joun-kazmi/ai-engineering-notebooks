@@ -1,0 +1,23 @@
+Paris is the capital of France and the country's largest city, located on the Seine river in the north-central part of the country. It has served as the political and cultural center of France for centuries and is home to the national government.
+
+Berlin is the capital of Germany. It became the capital of a reunified Germany in 1990 and is known for its history spanning the Cold War division of East and West Berlin, marked by the Berlin Wall which fell in 1989.
+
+Tokyo is the capital of Japan and one of the most populous metropolitan areas in the world. It is the seat of the Japanese government and the Imperial Palace, and serves as the country's main center for business, finance, and culture.
+
+The Eiffel Tower is a wrought-iron lattice tower located on the Champ de Mars in the French capital. Built in 1889 for the World's Fair, it was originally criticized by artists and intellectuals but became the most-visited paid monument in the world.
+
+French cuisine is renowned worldwide and includes dishes such as coq au vin, bouillabaisse, and croissants. Classical French cooking techniques form the foundation of much of modern Western culinary training, taught extensively in French cooking schools.
+
+Python is a high-level, interpreted programming language known for its readability and broad standard library. It is widely used in web development, data science, automation, and building AI applications, including retrieval-augmented generation systems.
+
+Retrieval-Augmented Generation (RAG) combines a retrieval system with a language model, allowing the model to answer questions using information fetched from an external knowledge base rather than relying solely on what it learned during training.
+
+The Amazon rainforest, spanning most of the Amazon basin in South America, is the largest tropical rainforest on Earth. It plays a major role in regulating global carbon levels and is home to an estimated ten percent of known species on the planet.
+
+Mount Everest, located in the Himalayas on the border between Nepal and the Tibet Autonomous Region of China, is Earth's highest mountain above sea level, with a peak that reaches 8,849 meters.
+
+The euro is the official currency used by twenty of the twenty-seven member states of the European Union, including France and Germany. It was introduced as an accounting currency in 1999 and as physical notes and coins in 2002.
+
+Coral reefs are underwater ecosystems built by colonies of tiny animals called coral polyps. They are highly sensitive to ocean temperature changes, and rising sea temperatures have caused widespread coral bleaching events in recent decades.
+
+The Great Wall of China is a series of fortifications built across the historical northern borders of China to protect against invasions. Construction began over two thousand years ago and continued across multiple dynasties.

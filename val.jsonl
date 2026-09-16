@@ -1,0 +1,1 @@
+{"messages": [{"role": "system", "content": "Classify the sentiment of the customer feedback as positive, negative, or neutral. Output only the label."}, {"role": "user", "content": "Not bad, but the colour is slightly off."}, {"role": "assistant", "content": "neutral"}]}
