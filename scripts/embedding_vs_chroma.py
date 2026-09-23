@@ -5,6 +5,8 @@
 
 
 import os
+from dotenv import load_dotenv
+load_dotenv()  # picks up .env from the repo root
 from openai import OpenAI
 
 API_KEY = os.environ["NVIDIA_API_KEY"]
@@ -14,13 +16,13 @@ client = OpenAI(base_url = "https://integrate.api.nvidia.com/v1",api_key=API_KEY
 # In[7]:
 
 
-EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"   # or any NIM embedding model
+EMBED_MODEL = "nvidia/nemotron-3-embed-1b"   # or any NIM embedding model
 
-def get_embedding(text: str):
+def get_embedding(text: str, input_type: str = "passage"):
     """Return embedding vector for a single text."""
     response = client.embeddings.create(
         model=EMBED_MODEL,
-        extra_body={"input_type": "query"}, # Use "query" or "document"
+        extra_body={"input_type": input_type},  # "passage" for documents, "query" for search queries
         input=[text]          # input is a list
     )
     return response.data[0].embedding
@@ -47,7 +49,7 @@ sentences = [
 query = "How do you feel about coding?"
 
 sentence_embs = [get_embedding(s) for s in sentences]
-query_emb = get_embedding(query)
+query_emb = get_embedding(query, input_type="query")
 
 
 sims = [cosine_similarity(query_emb, emb) for emb in sentence_embs]
@@ -62,6 +64,10 @@ from chromadb import Documents, EmbeddingFunction, Embeddings
 class NIMEmbeddingFunction(EmbeddingFunction):
     def __call__(self, input: Documents) -> Embeddings:
         return [get_embedding(text) for text in input]
+
+    def embed_query(self, input: Documents) -> Embeddings:
+        # Chroma calls this for query_texts, so queries get the query-side encoding
+        return [get_embedding(text, input_type="query") for text in input]
 
 chroma_client = chromadb.Client()
 collection = chroma_client.create_collection(name="test1", embedding_function=NIMEmbeddingFunction())

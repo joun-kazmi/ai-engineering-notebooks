@@ -5,6 +5,8 @@
 
 
 import os
+from dotenv import load_dotenv
+load_dotenv()  # picks up .env from the repo root
 from openai import OpenAI
 import math
 

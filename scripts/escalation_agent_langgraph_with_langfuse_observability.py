@@ -45,6 +45,8 @@
 import inspect
 import operator
 import os
+from dotenv import load_dotenv
+load_dotenv()  # picks up .env from the repo root
 from typing import Annotated, Literal, TypedDict
 import json
 import re

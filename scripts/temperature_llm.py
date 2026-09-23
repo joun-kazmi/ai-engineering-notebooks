@@ -4,10 +4,11 @@
 # In[1]:
 
 
-# Exercise 1: Your first API call with both OpenAI and Anthropic
+# Exercise 1: Your first API call
 import os
+from dotenv import load_dotenv
+load_dotenv()  # picks up .env from the repo root
 from openai import OpenAI
-from anthropic import Anthropic
 
 API_KEY = os.environ["NVIDIA_API_KEY"]
 # Store your keys in .env file
