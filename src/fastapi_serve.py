@@ -34,6 +34,9 @@ RAW_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 # ══════════════════════════════════════════════════════════
 def llm_structured(prompt: str, schema, max_retries: int = 3):
     schema_json = json.dumps(schema.model_json_schema(), indent=2)
+    # Constrain decoding to the schema; the prompt alone is not enough for Nemotron
+    # (it often wraps the answer in {"properties": ...} or adds trailing text)
+    response_format = {"type": "json_schema", "json_schema": {"name": schema.__name__, "schema": schema.model_json_schema()}}
     feedback = ""
     for attempt in range(1, max_retries + 1):
         full_prompt = (
@@ -45,7 +48,7 @@ def llm_structured(prompt: str, schema, max_retries: int = 3):
         if feedback:
             full_prompt += f"\n\nYour previous output FAILED validation:\n{feedback}\nFix these issues."
         
-        raw = llm_client.chat.completions.create(model=RAW_MODEL, extra_body=NO_THINK, messages=[{"role": "user", "content": full_prompt}]).choices[0].message.content or ""
+        raw = llm_client.chat.completions.create(model=RAW_MODEL, extra_body=NO_THINK, messages=[{"role": "user", "content": full_prompt}], response_format=response_format).choices[0].message.content or ""
         raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         if not raw.startswith("{"):
             match = re.search(r"\{.*\}", raw, re.DOTALL)

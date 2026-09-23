@@ -83,6 +83,9 @@ def llm_structured(prompt: str, schema, max_retries: int = 3):
     """
     # THE KEY FIX: show the model the target schema
     schema_json = json.dumps(schema.model_json_schema(), indent=2)
+    # Constrain decoding to the schema; the prompt alone is not enough for Nemotron
+    # (it often wraps the answer in {"properties": ...} or adds trailing text)
+    response_format = {"type": "json_schema", "json_schema": {"name": schema.__name__, "schema": schema.model_json_schema()}}
 
     feedback = ""
     for attempt in range(1, max_retries + 1):
@@ -98,7 +101,7 @@ def llm_structured(prompt: str, schema, max_retries: int = 3):
                 f"Fix these issues and return corrected JSON."
             )
 
-        raw = llm.invoke(full_prompt).content or ""
+        raw = llm.invoke(full_prompt, response_format=response_format).content or ""
         raw = raw.strip()
         # Strip fences defensively (reasoning models sometimes wrap output)
         raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
