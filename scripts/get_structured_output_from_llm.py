@@ -57,8 +57,8 @@ class EscalationAnalysis(BaseModel):
 response = client.beta.chat.completions.parse(
     model="openai/gpt-oss-20b",
     messages=[
-        {"role": "system", "text": "Analyze the escalation. Think step-by-step in the reasoning field."},
-        {"role": "user", "text": f"<ticket_data>{ticket_payload}</ticket_data>"}
+        {"role": "system", "content": "Analyze the escalation. Think step-by-step in the reasoning field."},
+        {"role": "user", "content": f"<ticket_data>{ticket_payload}</ticket_data>"}
     ],
     temperature=0.0,
     response_format=EscalationAnalysis # Forces the LLM to output this exact structure

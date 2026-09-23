@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
 from openai import OpenAI
 import math
+import json
 
 API_KEY = os.environ["NVIDIA_API_KEY"]
 client = OpenAI(base_url = "https://integrate.api.nvidia.com/v1",api_key=API_KEY)
