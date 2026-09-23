@@ -101,6 +101,13 @@ uvicorn src.fastapi_serve:app_fastapi --reload
 
 `app_fastapi` is the FastAPI instance; `app` in the same module is the compiled LangGraph.
 
+To run the offline smoke tests (no API keys or LLM calls; the same suite runs in CI):
+
+```bash
+pip install pytest
+pytest -q tests
+```
+
 ## Scope
 
 These are reference implementations and experiments, not a production system. They exist to work through each pattern in isolation, because the tradeoffs are easier to see when one thing changes at a time.
