@@ -15,7 +15,7 @@ from openai import OpenAI
 
 API_KEY = os.environ["NVIDIA_API_KEY"]
 client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=API_KEY)
-MODEL = "openai/gpt-oss-20b"
+MODEL = "nvidia/nemotron-3-super-120b-a12b"
 EMBED_MODEL = "nvidia/nemotron-3-embed-1b"
 
 def get_embedding(text, input_type="passage"):

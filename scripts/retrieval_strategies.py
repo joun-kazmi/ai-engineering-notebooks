@@ -7,6 +7,8 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from openai import OpenAI
 
 API_KEY = os.environ["NVIDIA_API_KEY"]
@@ -17,7 +19,7 @@ client = OpenAI(base_url = "https://integrate.api.nvidia.com/v1",api_key=API_KEY
 
 
 EMBED_MODEL = "nvidia/nemotron-3-embed-1b"   # or any NIM embedding model
-MODEL = "openai/gpt-oss-20b"
+MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
 def get_embedding(text: str, input_type: str = "passage"):
     """Return embedding vector for a single text."""
@@ -68,6 +70,7 @@ def expand_query(user_query):
     print('prompt ', prompt)
     response = client.chat.completions.create(
         model=MODEL,
+        extra_body=NO_THINK,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=100
     )
@@ -82,6 +85,7 @@ def hyde_query(user_query):
     prompt = f"Write a short paragraph that answers this question, even if you don't know exact details.\nQuestion: {user_query}"
     response = client.chat.completions.create(
         model=MODEL,
+        extra_body=NO_THINK,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=200
     )
@@ -99,6 +103,7 @@ def generate_multi_queries(user_query, n=3):
     prompt = f"Generate {n} different search queries related to: {user_query}"
     response = client.chat.completions.create(
         model=MODEL,
+        extra_body=NO_THINK,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=100
     )

@@ -7,6 +7,8 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from openai import OpenAI
 import math
 
@@ -17,7 +19,8 @@ prompt = "The capital of France is"
 
 # We ask the API to return the log probabilities
 response = client.chat.completions.create(
-    model="openai/gpt-oss-20b", # use a cheap/fast model
+    model="nvidia/nemotron-3-super-120b-a12b",
+    extra_body=NO_THINK,  # otherwise the first token is reasoning ("Okay"), not the answer
     messages=[{"role": "user", "content": prompt}],
     max_tokens=1,
     logprobs=True,

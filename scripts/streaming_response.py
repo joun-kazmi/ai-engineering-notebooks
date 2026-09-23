@@ -7,6 +7,8 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from openai import OpenAI
 import math
 
@@ -18,7 +20,8 @@ client = OpenAI(base_url = "https://integrate.api.nvidia.com/v1",api_key=API_KEY
 
 
 stream = client.chat.completions.create(
-    model="openai/gpt-oss-20b",
+    model="nvidia/nemotron-3-super-120b-a12b",
+    extra_body=NO_THINK,
     messages=[{"role": "user", "content": "Explain quantum computing in 3 sentences."}],
     stream=True  # This is all you change
 )

@@ -7,6 +7,8 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from openai import OpenAI
 import math
 
@@ -55,7 +57,8 @@ class EscalationAnalysis(BaseModel):
 
 # 2. Pass it to the API
 response = client.beta.chat.completions.parse(
-    model="openai/gpt-oss-20b",
+    model="nvidia/nemotron-3-super-120b-a12b",
+    extra_body=NO_THINK,
     messages=[
         {"role": "system", "content": "Analyze the escalation. Think step-by-step in the reasoning field."},
         {"role": "user", "content": f"<ticket_data>{ticket_payload}</ticket_data>"}

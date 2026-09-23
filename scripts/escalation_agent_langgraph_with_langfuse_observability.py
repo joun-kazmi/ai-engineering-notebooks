@@ -47,6 +47,8 @@ import operator
 import os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from typing import Annotated, Literal, TypedDict
 import json
 import re
@@ -64,9 +66,10 @@ from langgraph.types import Command, interrupt
 
 # ── 1. MODEL ──────────────────────────────────────────────
 llm = ChatOpenAI(
-    model="openai/gpt-oss-20b",
+    model="nvidia/nemotron-3-super-120b-a12b",
     base_url="https://integrate.api.nvidia.com/v1",
     api_key=os.environ["NVIDIA_API_KEY"],
+    extra_body=NO_THINK,
 )
 
 

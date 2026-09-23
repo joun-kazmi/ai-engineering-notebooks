@@ -15,6 +15,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 
 # ══════════════════════════════════════════════════════════
 # 1. MODEL SETUP
@@ -25,7 +27,7 @@ llm_client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
     api_key=NVIDIA_API_KEY,
 )
-RAW_MODEL = "openai/gpt-oss-20b"
+RAW_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
 # ══════════════════════════════════════════════════════════
 # 2. RELIABILITY HELPER (Schema-injected)
@@ -43,7 +45,7 @@ def llm_structured(prompt: str, schema, max_retries: int = 3):
         if feedback:
             full_prompt += f"\n\nYour previous output FAILED validation:\n{feedback}\nFix these issues."
         
-        raw = llm_client.chat.completions.create(model=RAW_MODEL, messages=[{"role": "user", "content": full_prompt}]).choices[0].message.content or ""
+        raw = llm_client.chat.completions.create(model=RAW_MODEL, extra_body=NO_THINK, messages=[{"role": "user", "content": full_prompt}]).choices[0].message.content or ""
         raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         if not raw.startswith("{"):
             match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -56,7 +58,7 @@ def llm_structured(prompt: str, schema, max_retries: int = 3):
     raise RuntimeError(f"{schema.__name__} validation failed after {max_retries} attempts")
 
 # ══════════════════════════════════════════════════════════
-# 3. TOOLS & INVESTIGATOR (Raw SDK to avoid NIM harmony bug)
+# 3. TOOLS & INVESTIGATOR (raw SDK tool-calling loop)
 # ══════════════════════════════════════════════════════════
 SYSTEM = ("You investigate incidents. Use your tools to gather evidence. "
           "When done, end with a 3-line RCA draft: root cause / evidence / suggested action.")
@@ -89,7 +91,7 @@ RAW_TOOLS = [
 def run_investigation(task: str, max_iterations: int = 8) -> str:
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task}]
     for _ in range(max_iterations):
-        resp = llm_client.chat.completions.create(model=RAW_MODEL, messages=messages, tools=RAW_TOOLS, tool_choice="auto")
+        resp = llm_client.chat.completions.create(model=RAW_MODEL, extra_body=NO_THINK, messages=messages, tools=RAW_TOOLS, tool_choice="auto")
         msg = resp.choices[0].message
         assistant_msg = {"role": "assistant", "content": msg.content or ""}
         if msg.tool_calls:
@@ -216,6 +218,7 @@ class ApprovalPayload(BaseModel):
 async def generate(req: GenerateRequest):
     response = llm_client.chat.completions.create(
         model=RAW_MODEL,
+        extra_body=NO_THINK,
         messages=[{"role": "user", "content": req.prompt}],
         max_tokens=200,
         temperature=0.3

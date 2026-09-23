@@ -323,8 +323,10 @@ from langchain_openai import ChatOpenAI
 import os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 
-llm = ChatOpenAI(model="openai/gpt-oss-20b", base_url="https://integrate.api.nvidia.com/v1", api_key=os.environ["NVIDIA_API_KEY"])
+llm = ChatOpenAI(model="nvidia/nemotron-3-super-120b-a12b", base_url="https://integrate.api.nvidia.com/v1", api_key=os.environ["NVIDIA_API_KEY"], extra_body=NO_THINK)
 
 response = secure_llm_call(
     "My email is john@example.com and the server at 192.168.1.10 is down. Can you help?",

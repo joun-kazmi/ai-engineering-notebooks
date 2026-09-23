@@ -7,6 +7,8 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from openai import OpenAI
 import math
 import json
@@ -18,7 +20,7 @@ client = OpenAI(base_url = "https://integrate.api.nvidia.com/v1",api_key=API_KEY
 # In[22]:
 
 
-MODEL = "openai/gpt-oss-20b"
+MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
 def get_current_time(city: str) -> str:
     return f"12:00 (simulated) in {city}"
@@ -51,6 +53,7 @@ def run_agent_with_tools(user_input, verbose=True):
     while True:
         response = client.chat.completions.create(
             model=MODEL,
+            extra_body=NO_THINK,
             messages=messages,
             tools=TOOLS,
             tool_choice="auto"
@@ -103,7 +106,7 @@ print("Final answer:", final_answer)
 import json
 from openai import OpenAI
 
-MODEL = "openai/gpt-oss-20b"
+MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
 # 1. Define the actual function(s)
 def get_current_time(city: str) -> str:
@@ -139,6 +142,7 @@ def stream_agent_with_tools(user_input):
         print("\n--- New stream call ---")
         stream = client.chat.completions.create(
             model=MODEL,
+            extra_body=NO_THINK,
             messages=messages,
             tools=TOOLS,
             stream=True

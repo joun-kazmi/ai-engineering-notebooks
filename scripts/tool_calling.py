@@ -7,6 +7,8 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from openai import OpenAI
 import math
 
@@ -90,7 +92,8 @@ messages = [
 
 print("--- STEP 1: Sending initial prompt to LLM ---")
 response = client.chat.completions.create(
-    model="openai/gpt-oss-20b",
+    model="nvidia/nemotron-3-super-120b-a12b",
+    extra_body=NO_THINK,
     messages=messages,
     tools=tools,
     tool_choice="auto",  # Allows the LLM to choose whether to call a tool or reply directly
@@ -136,7 +139,8 @@ if tool_calls:
     # -----------------------------------------------------------------------
     print("\n--- STEP 3: Sending tool output back to LLM for final answer ---")
     second_response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
+        model="nvidia/nemotron-3-super-120b-a12b",
+        extra_body=NO_THINK,
         messages=messages,
         temperature=0.0
     )

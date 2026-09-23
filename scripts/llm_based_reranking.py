@@ -7,6 +7,8 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from openai import OpenAI
 
 API_KEY = os.environ["NVIDIA_API_KEY"]
@@ -15,7 +17,7 @@ client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
     api_key=API_KEY
 )
-MODEL = "openai/gpt-oss-20b"
+MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
 def llm_rerank(query, documents, top_k=3, verbose=True):
     """
@@ -31,6 +33,7 @@ Relevance score (1-10):"""
 
         response = client.chat.completions.create(
             model=MODEL,
+            extra_body=NO_THINK,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=300,
             temperature=0
