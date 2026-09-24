@@ -80,7 +80,7 @@ Multi-step agents on LangGraph, using incident response and support triage as th
 
 ## Running these
 
-All models are served from [NVIDIA NIM](https://build.nvidia.com)'s OpenAI-compatible endpoint (`openai/gpt-oss-20b` for chat, `nvidia/nemotron-3-embed-1b` for embeddings), so the only key you need for most of the repo is `NVIDIA_API_KEY`. The Langfuse keys are needed only for the escalation agent.
+All models are served from [NVIDIA NIM](https://build.nvidia.com)'s OpenAI-compatible endpoint (`nvidia/nemotron-3-super-120b-a12b` for chat, `nvidia/nemotron-3-embed-1b` for embeddings), so the only key you need for most of the repo is `NVIDIA_API_KEY`. The Langfuse keys are needed only for the escalation agent.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -88,6 +88,8 @@ pip install -r requirements.txt
 cp .env.example .env    # then fill in NVIDIA_API_KEY
 jupyter lab
 ```
+
+Nemotron reasons out loud by default, so every chat call passes `extra_body=NO_THINK` (`chat_template_kwargs.enable_thinking=False`) to get direct answers. Without it, short-answer calls such as YES/NO judges or single-token logprobs come back as the start of the model's reasoning.
 
 Notebooks, scripts, and the service load `.env` from the repo root automatically (via `python-dotenv`); variables already exported in your shell take precedence. No keys are committed, and `.env` is gitignored.
 

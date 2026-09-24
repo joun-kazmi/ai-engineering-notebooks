@@ -7,13 +7,15 @@
 import json, os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from openai import OpenAI
 
 client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
     api_key=os.environ["NVIDIA_API_KEY"],
 )
-MODEL = "openai/gpt-oss-20b"
+MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
 SYSTEM_PROMPT = """You are an incident response assistant for a SaaS platform.
 You investigate service issues by searching logs, checking recent deploys,
@@ -116,6 +118,7 @@ def run_agent(user_query: str, max_iterations: int = 8):
     for step in range(1, max_iterations + 1):
         resp = client.chat.completions.create(
             model=MODEL,
+            extra_body=NO_THINK,
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",   # model decides: answer or call a tool
@@ -178,6 +181,7 @@ def plan_and_execute(alert: str):
     # PHASE 1: plan
     plan_resp = client.chat.completions.create(
         model=MODEL,
+        extra_body=NO_THINK,
         messages=[{"role": "user", "content": PLANNER_PROMPT + f"\n\nAlert: {alert}"}],
     )
     plan_text = plan_resp.choices[0].message.content
@@ -208,6 +212,7 @@ def plan_and_execute(alert: str):
     # PHASE 3: synthesize
     return client.chat.completions.create(
         model=MODEL,
+        extra_body=NO_THINK,
         messages=[{"role": "user", "content":
             f"Alert: {alert}\n\nFindings:\n{json.dumps(findings, indent=2)}\n\nWrite the root-cause summary."}],
     ).choices[0].message.content
@@ -223,12 +228,13 @@ print( answer)
 
 def with_reflection(task: str, max_rounds: int = 2):
     draft = client.chat.completions.create(
-        model=MODEL, messages=[{"role": "user", "content": task}]
+        model=MODEL, extra_body=NO_THINK, messages=[{"role": "user", "content": task}]
     ).choices[0].message.content
 
     for _ in range(max_rounds):
         critique = client.chat.completions.create(
             model=MODEL,
+            extra_body=NO_THINK,
             messages=[{"role": "user", "content":
                 f"Review this RCA draft for missing evidence, unsupported claims, or vague "
                 f"recommendations. Reply ONLY 'APPROVED' if it's solid, else list issues.\n\n{draft}"}],
@@ -238,6 +244,7 @@ def with_reflection(task: str, max_rounds: int = 2):
             return draft
         draft = client.chat.completions.create(
             model=MODEL,
+            extra_body=NO_THINK,
             messages=[{"role": "user", "content": f"Original task: {task}\n\nYour draft:\n{draft}\n\n"
                                                   f"Fix these issues:\n{critique}"}],
         ).choices[0].message.content

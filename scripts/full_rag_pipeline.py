@@ -8,6 +8,8 @@ import os, re, json
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 import numpy as np
 from openai import OpenAI
 from rank_bm25 import BM25Okapi
@@ -22,7 +24,7 @@ client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
     api_key=API_KEY,
 )
-MODEL = "openai/gpt-oss-20b"
+MODEL = "nvidia/nemotron-3-super-120b-a12b"
 EMBED_MODEL = "nvidia/nemotron-3-embed-1b"
 
 RETRY = dict(wait=wait_exponential(min=1, max=20), stop=stop_after_attempt(5))
@@ -137,6 +139,7 @@ Documents:
 {numbered}"""
     resp = client.chat.completions.create(
         model=MODEL,
+        extra_body=NO_THINK,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=500,
         temperature=0,
@@ -180,6 +183,7 @@ Context:
 Answer:"""
     resp = client.chat.completions.create(
         model=MODEL,
+        extra_body=NO_THINK,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=300,
         temperature=0.3,
@@ -195,7 +199,7 @@ Question: {question}
 Context: {context}
 Answer: {answer}"""
     resp = client.chat.completions.create(
-        model=MODEL, messages=[{"role": "user", "content": prompt}],
+        model=MODEL, extra_body=NO_THINK, messages=[{"role": "user", "content": prompt}],
         max_tokens=3, temperature=0,
     )
     return "YES" in resp.choices[0].message.content.upper()
@@ -209,7 +213,7 @@ def evaluate_context_precision(question, top_doc):
 Question: {question}
 Document: {top_doc}"""
     resp = client.chat.completions.create(
-        model=MODEL, messages=[{"role": "user", "content": prompt}],
+        model=MODEL, extra_body=NO_THINK, messages=[{"role": "user", "content": prompt}],
         max_tokens=3, temperature=0,
     )
     return "YES" in resp.choices[0].message.content.upper()

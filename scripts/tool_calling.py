@@ -7,6 +7,8 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from openai import OpenAI
 import math
 
@@ -90,7 +92,8 @@ messages = [
 
 print("--- STEP 1: Sending initial prompt to LLM ---")
 response = client.chat.completions.create(
-    model="openai/gpt-oss-20b",
+    model="nvidia/nemotron-3-super-120b-a12b",
+    extra_body=NO_THINK,
     messages=messages,
     tools=tools,
     tool_choice="auto",  # Allows the LLM to choose whether to call a tool or reply directly
@@ -111,32 +114,46 @@ if tool_calls:
     
     for tool_call in tool_calls:
         function_name = tool_call.function.name
-        function_args = json.loads(tool_call.function.arguments)
+        try:
+            function_args = json.loads(tool_call.function.arguments)
+        except json.JSONDecodeError:
+            function_args = None  # malformed JSON from the model; reported back below
         
         print(f"Executing local function: {function_name}(**{function_args})")
         
         # Look up the actual function and invoke it dynamically
         function_to_call = available_tools.get(function_name)
-        if function_to_call:
-            tool_output = function_to_call(**function_args)
+        if function_to_call is None:
+            # Hallucinated tool name: still answer the call, or the next request would
+            # contain a tool_call with no matching tool result
+            tool_output = json.dumps({"error": f"Unknown tool: {function_name}"})
+        else:
+            try:
+                if function_args is None:
+                    raise TypeError(f"arguments are not valid JSON: {tool_call.function.arguments!r}")
+                tool_output = function_to_call(**function_args)
+            except TypeError as e:
+                # Malformed arguments (bad JSON or a wrong parameter name): report back so the model can recover
+                tool_output = json.dumps({"error": f"Invalid arguments for {function_name}: {e}"})
             
-            # ---------------------------------------------------------------
-            # 5. PASS TOOL RESULTS BACK TO THE LLM
-            # ---------------------------------------------------------------
-            messages.append({
-                "tool_call_id": tool_call.id,  # Matches result to the exact request
-                "role": "tool",
-                "name": function_name,
-                "content": tool_output  # Function output MUST be a string
-            })
-            print(f"Tool Result returned: {tool_output}")
+        # ---------------------------------------------------------------
+        # 5. PASS TOOL RESULTS BACK TO THE LLM
+        # ---------------------------------------------------------------
+        messages.append({
+            "tool_call_id": tool_call.id,  # Matches result to the exact request
+            "role": "tool",
+            "name": function_name,
+            "content": tool_output  # Function output MUST be a string
+        })
+        print(f"Tool Result returned: {tool_output}")
 
     # -----------------------------------------------------------------------
     # 6. FINAL LLM CALL FOR SYNTHESIS
     # -----------------------------------------------------------------------
     print("\n--- STEP 3: Sending tool output back to LLM for final answer ---")
     second_response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
+        model="nvidia/nemotron-3-super-120b-a12b",
+        extra_body=NO_THINK,
         messages=messages,
         temperature=0.0
     )

@@ -7,15 +7,17 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from typing import Literal, TypedDict
 from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
 
-llm = ChatOpenAI(model="openai/gpt-oss-20b",
+llm = ChatOpenAI(model="nvidia/nemotron-3-super-120b-a12b",
                  base_url="https://integrate.api.nvidia.com/v1",
-                 api_key=os.environ["NVIDIA_API_KEY"])
+                 api_key=os.environ["NVIDIA_API_KEY"], extra_body=NO_THINK)
 
 # ── THE WHITEBOARD ─────────────────────────────────────────
 class TicketState(TypedDict):

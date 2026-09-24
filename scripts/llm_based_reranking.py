@@ -5,8 +5,11 @@
 
 
 import os
+import re
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from openai import OpenAI
 
 API_KEY = os.environ["NVIDIA_API_KEY"]
@@ -15,7 +18,7 @@ client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
     api_key=API_KEY
 )
-MODEL = "openai/gpt-oss-20b"
+MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
 def llm_rerank(query, documents, top_k=3, verbose=True):
     """
@@ -27,22 +30,24 @@ def llm_rerank(query, documents, top_k=3, verbose=True):
         prompt = f"""On a scale of 1 to 10, how relevant is the following document to the query?
 Query: {query}
 Document: {doc}
+Respond with only the number.
 Relevance score (1-10):"""
 
         response = client.chat.completions.create(
             model=MODEL,
+            extra_body=NO_THINK,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=300,
             temperature=0
         )
 
-        print('response ', response)
-
         raw_score = response.choices[0].message.content.strip()
-        try:
-            score = float(raw_score)
-        except ValueError:
-            # If the model doesn't return a number, assign 0 and optionally log
+        # Accept only a bare number in range. Pulling a number out of prose is unreliable:
+        # "On a scale of 1 to 10, I'd give this a 9" would parse as 1.
+        match = re.fullmatch(r"\d+(?:\.\d+)?", raw_score)
+        score = float(match.group()) if match else None
+        if score is None or not 1 <= score <= 10:
+            # Unparseable or out of range: rank it last and log it
             print(f"Warning: Could not parse score for doc: '{doc[:50]}...' -> '{raw_score}'")
             score = 0.0
 

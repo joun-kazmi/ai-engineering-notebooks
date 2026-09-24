@@ -45,6 +45,19 @@ def test_notebook_is_valid(path):
     nbformat.validate(nbformat.read(path, as_version=4))
 
 
+@pytest.mark.parametrize("path", NOTEBOOKS, ids=rel)
+def test_notebook_has_no_error_outputs(path):
+    # Committed outputs are what readers see; a stack trace there means a broken run was checked in
+    nb = nbformat.read(path, as_version=4)
+    errors = [
+        f"{out.get('ename')}: {out.get('evalue', '')[:80]}"
+        for cell in nb.cells
+        for out in cell.get("outputs", [])
+        if out.get("output_type") == "error"
+    ]
+    assert not errors, errors
+
+
 def test_env_example_lists_every_variable_the_code_reads():
     documented = set(re.findall(r"^([A-Z0-9_]+)=", (ROOT / ".env.example").read_text(), re.M))
     used = {name for p in ALL_CODE for name in ENV_VAR.findall(code_of(p))}

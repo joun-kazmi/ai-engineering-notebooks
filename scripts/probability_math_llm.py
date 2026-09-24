@@ -7,21 +7,30 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
+# Nemotron reasons out loud by default; these demos want direct answers
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 from openai import OpenAI
 import math
 
 API_KEY = os.environ["NVIDIA_API_KEY"]
 client = OpenAI(base_url = "https://integrate.api.nvidia.com/v1",api_key=API_KEY)
 
-prompt = "The capital of France is"
+# In a chat API, logprobs describe the first token of the assistant's reply, not a
+# continuation of the user's text. So ask for the missing word directly: the first
+# reply token is then the model's answer, and its probability is meaningful.
+prompt = (
+    'Complete the phrase "The capital of France is ___" '
+    'with exactly one word. Output only the missing word.'
+)
 
 # We ask the API to return the log probabilities
 response = client.chat.completions.create(
-    model="openai/gpt-oss-20b", # use a cheap/fast model
+    model="nvidia/nemotron-3-super-120b-a12b",
+    extra_body=NO_THINK,  # otherwise the first token is reasoning ("Okay"), not the answer
     messages=[{"role": "user", "content": prompt}],
     max_tokens=1,
     logprobs=True,
-    top_logprobs=5 # Ask for the top 5 probable next words
+    top_logprobs=5 # Ask for the top 5 candidate first tokens of the reply
 )
 
 # Extract the logprobs
@@ -33,7 +42,7 @@ else:
     top_logprobs_dict = response.choices[0].logprobs.content[0].top_logprobs
 
     print(f"Prompt: '{prompt}'\n")
-    print("Top 5 Next Word Predictions (Mathematical Probabilities):")
+    print("Top 5 candidate first tokens of the assistant's reply:")
     print("-" * 50)
 
     # Logprobs are returned as natural logs (base e). We convert them back to standard probabilities
