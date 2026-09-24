@@ -1,0 +1,43 @@
+The payments-api service connects to postgres-primary through a connection pool capped at 100 connections. When error_rate exceeds 10%, the on-call runbook calls for rolling back the last deploy before escalating.
+
+postgres-primary is the primary write node for the payments cluster. Connection pool exhaustion on this node manifests as timeout errors in dependent services such as payments-api and checkout-api.
+
+checkout-api handles final order confirmation and charges the customer's card via payments-api. It has no independent database and fails closed if payments-api is unreachable.
+
+Deploys to payments-api are versioned, for example v2.14.3, and tagged with the author and deploy time. Rolling back means redeploying the previous tagged version, not reverting the git commit.
+
+SEV1 incidents require paging the on-call engineer within five minutes and opening an incident channel. SEV2 incidents are handled during business hours. SEV3 incidents are logged and auto-closed with a docs link.
+
+Rate limiting on the public API gateway is enforced per API key using a token bucket algorithm, refilling at 100 requests per minute with a burst capacity of 20.
+
+The auth-service issues short-lived JWTs signed with an asymmetric key pair. The private signing key never leaves the auth-service's KMS-backed signer.
+
+Prompt injection occurs when untrusted text, such as a retrieved document, a tool result, or a user message, contains instructions the model follows instead of treating as data, potentially bypassing the system prompt's intent.
+
+Retrieval-augmented generation reduces hallucination by grounding answers in retrieved passages, but it also introduces a new attack surface: anything present in retrieved context can attempt to steer the model, so retrieved content must be treated as untrusted input, not as instructions.
+
+Least-privilege tool design means a read-only tool like search_logs should not share credentials or a code path with a write tool like rollback_deploy, so a compromised prompt cannot escalate from reading data to writing it.
+
+Human-in-the-loop approval gates sit before any tool call with a side effect that is expensive to reverse, such as a production rollback, a page to on-call, or a customer-facing notification.
+
+BM25 ranks documents by term frequency and inverse document frequency, adjusted for document length. It retrieves well on exact keyword and identifier matches such as error codes or service names.
+
+Dense retrieval encodes queries and passages into the same embedding space and ranks by cosine similarity. It retrieves well on paraphrases and semantically related text that shares little vocabulary with the query.
+
+Reciprocal rank fusion combines multiple ranked lists by summing one divided by a constant plus rank for each list a document appears in, without needing the underlying scores to share a scale.
+
+An LLM reranker re-scores a retriever's shortlist against the full query using the language model itself, trading extra latency and token cost for higher precision at the very top of the ranking.
+
+Idempotency keys let a client safely retry a write request, such as triggering a rollback, without risking that the retry executes the action a second time if the first attempt actually succeeded but its response was lost.
+
+A per-tool timeout bounds how long an agent will wait on any single tool call. Without one, a hung log-search call can stall an entire incident response run indefinitely.
+
+A tool budget caps the total number of tool calls or tokens an agent may use per run, which prevents a stuck reasoning loop from silently accumulating cost.
+
+Langfuse traces a LangGraph run as a tree of spans, one per node, capturing latency, token usage, and the model and provider used for each LLM call inside that node.
+
+A faithfulness check asks a judge model whether every claim in a generated answer is supported by the retrieved context, catching cases where the model added an unsupported detail.
+
+Mean reciprocal rank scores a ranking by the position of the first relevant result: one divided by that rank, averaged across queries, so it rewards getting a relevant result near the top even when overall recall is low.
+
+Normalized discounted cumulative gain rewards relevant results near the top of the ranking more than relevant results further down, and normalizes against the best possible ordering so scores are comparable across queries of different difficulty.

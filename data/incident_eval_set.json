@@ -1,0 +1,32 @@
+[
+  {
+    "id": "inc01",
+    "alert": "payments-api error rate 31% since 10:42, users can't checkout",
+    "expected_severity": "SEV1",
+    "expected_action": "rollback_deploy"
+  },
+  {
+    "id": "inc02",
+    "alert": "checkout-api p95 latency critical, timeouts spiking, revenue impact",
+    "expected_severity": "SEV1",
+    "expected_action": "rollback_deploy"
+  },
+  {
+    "id": "inc03",
+    "alert": "auth-service latency slightly up, no user impact",
+    "expected_severity": "SEV3",
+    "expected_action": null
+  },
+  {
+    "id": "inc04",
+    "alert": "payments-api connection pool exhausted, error rate climbing after last deploy",
+    "expected_severity": "SEV2",
+    "expected_action": "rollback_deploy"
+  },
+  {
+    "id": "inc05",
+    "alert": "auth-service background job queue backed up, no customer-facing errors yet",
+    "expected_severity": "SEV3",
+    "expected_action": null
+  }
+]
