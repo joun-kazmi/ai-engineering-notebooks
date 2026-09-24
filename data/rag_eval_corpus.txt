@@ -41,3 +41,19 @@ A faithfulness check asks a judge model whether every claim in a generated answe
 Mean reciprocal rank scores a ranking by the position of the first relevant result: one divided by that rank, averaged across queries, so it rewards getting a relevant result near the top even when overall recall is low.
 
 Normalized discounted cumulative gain rewards relevant results near the top of the ranking more than relevant results further down, and normalizes against the best possible ordering so scores are comparable across queries of different difficulty.
+
+inventory-api connects to postgres-replica through a read-only connection pool capped at 40 connections. Replica lag above 30 seconds triggers a warning but never a rollback.
+
+Rolling back a feature flag in flags-service means toggling it off in the admin console. No redeploy is needed, and the change propagates to clients within a minute.
+
+Data-pipeline incidents are never paged. They are posted to the team's channel and triaged at the next standup, regardless of severity.
+
+The internal admin API is rate limited by source IP address using a fixed window of 1000 requests per hour, separate from the public gateway.
+
+Session cookies on the marketing site are signed with a symmetric HMAC secret that is rotated monthly and stored in the deploy pipeline's secret store.
+
+Jailbreaking is when a user directly asks the model to ignore its rules, for example through role-play. Unlike injection via retrieved content, it arrives in the user's own turn.
+
+A circuit breaker stops an application from repeatedly calling a downstream dependency that is failing, returning a fallback until the dependency recovers.
+
+Precision at K is the fraction of the top K results that are relevant, ignoring how they are ordered within those K results.

@@ -14,7 +14,7 @@ means editing `.env`, not the notebooks.
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root, regardless of the caller's working directory — same convention
@@ -37,7 +37,7 @@ _PROVIDER_DEFAULTS = {
     },
     "anthropic": {
         "base_url": "https://api.anthropic.com/v1",
-        "model": "claude-sonnet-4-5",
+        "model": "claude-sonnet-5",
         "embedding_model": None,  # Anthropic has no embeddings endpoint
     },
 }
@@ -66,6 +66,20 @@ class Settings(BaseSettings):
     langfuse_public_key: SecretStr | None = None
     langfuse_secret_key: SecretStr | None = None
     langfuse_base_url: str = "https://cloud.langfuse.com"
+
+    @field_validator(
+        "llm_base_url", "llm_model", "embedding_model",
+        "nvidia_api_key", "openai_api_key", "anthropic_api_key",
+        "langfuse_public_key", "langfuse_secret_key",
+        mode="before",
+    )
+    @classmethod
+    def _blank_is_unset(cls, v):
+        # `.env.example` ships `NVIDIA_API_KEY=` etc.; a blank line copied from it
+        # must mean "not configured" (offline fallback), not an empty key -> 401.
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
     @property
     def _defaults(self) -> dict:
@@ -123,8 +137,13 @@ def get_settings() -> "Settings":
 NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 
 
-def make_chat_client(settings: "Settings | None" = None):
+def make_chat_client(settings: "Settings | None" = None, max_retries: int = 2):
     """OpenAI-compatible client (chat + embeddings) for the configured provider.
+
+    `max_retries` is the SDK's own exponential backoff on 408/409/429/5xx and
+    connection errors. Eval harnesses that make hundreds of calls should raise
+    it — hosted NIM endpoints return transient 503 "overloaded" often enough
+    that one unlucky call otherwise kills a whole run.
 
     Anthropic's API isn't OpenAI-compatible for tool calling / embeddings, so
     this raises for llm_provider="anthropic" — use langchain-anthropic or the
@@ -138,4 +157,4 @@ def make_chat_client(settings: "Settings | None" = None):
             "make_chat_client() only supports OpenAI-compatible providers (nvidia, openai). "
             "Use the Anthropic SDK or langchain-anthropic directly for llm_provider='anthropic'."
         )
-    return OpenAI(base_url=s.resolved_base_url, api_key=s.require_api_key())
+    return OpenAI(base_url=s.resolved_base_url, api_key=s.require_api_key(), max_retries=max_retries)

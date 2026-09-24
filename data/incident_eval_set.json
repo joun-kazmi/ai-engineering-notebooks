@@ -28,5 +28,17 @@
     "alert": "auth-service background job queue backed up, no customer-facing errors yet",
     "expected_severity": "SEV3",
     "expected_action": null
+  },
+  {
+    "id": "inc06",
+    "alert": "payments-api completely down, all card charges failing, revenue impact",
+    "expected_severity": "SEV1",
+    "expected_action": "rollback_deploy"
+  },
+  {
+    "id": "inc07",
+    "alert": "auth-service TLS certificate expires in 21 days, renewal ticket already open",
+    "expected_severity": "SEV3",
+    "expected_action": null
   }
 ]
