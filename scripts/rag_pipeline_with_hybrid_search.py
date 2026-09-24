@@ -5,6 +5,8 @@
 
 
 import os
+from dotenv import load_dotenv
+load_dotenv()  # picks up .env from the repo root
 import chromadb
 from chromadb import Documents, EmbeddingFunction, Embeddings
 from rank_bm25 import BM25Okapi
@@ -14,10 +16,11 @@ from openai import OpenAI
 API_KEY = os.environ["NVIDIA_API_KEY"]
 client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=API_KEY)
 MODEL = "openai/gpt-oss-20b"
-EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"
+EMBED_MODEL = "nvidia/nemotron-3-embed-1b"
 
-def get_embedding(text):
-    return client.embeddings.create(model=EMBED_MODEL, input=[text], extra_body={"input_type": "query"}).data[0].embedding
+def get_embedding(text, input_type="passage"):
+    # "passage" for documents, "query" for search queries
+    return client.embeddings.create(model=EMBED_MODEL, input=[text], extra_body={"input_type": input_type}).data[0].embedding
 
 def cosine_similarity(a, b):
     a, b = np.array(a), np.array(b)
@@ -27,6 +30,10 @@ def cosine_similarity(a, b):
 class NIMEmbeddingFunction(EmbeddingFunction):
     def __call__(self, input: Documents) -> Embeddings:
         return [get_embedding(text) for text in input]
+
+    def embed_query(self, input: Documents) -> Embeddings:
+        # Chroma calls this for query_texts, so queries get the query-side encoding
+        return [get_embedding(text, input_type="query") for text in input]
 
 # Sample documents (in practice, you'd parse PDFs and chunk them)
 documents = [
@@ -54,7 +61,7 @@ def hybrid_search(query, alpha=0.5, k=2):
     # BM25 scores
     bm25_scores = bm25.get_scores(query.split())
     # Vector scores
-    query_emb = get_embedding(query)
+    query_emb = get_embedding(query, input_type="query")
     vector_scores = [cosine_similarity(query_emb, emb) for emb in doc_embeddings]
     
     # Normalize

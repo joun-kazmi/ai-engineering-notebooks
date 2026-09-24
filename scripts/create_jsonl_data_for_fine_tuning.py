@@ -6,6 +6,9 @@
 
 import json
 import random
+from pathlib import Path
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 # Example raw data (in real life, you'd gather from logs, surveys, etc.)
 raw_data = [
@@ -42,11 +45,11 @@ train_jsonl = convert_to_openai_format(train_data)
 val_jsonl = convert_to_openai_format(val_data)
 
 # Write to files
-with open("../data/train.jsonl", "w") as f:
+with open(DATA_DIR / "train.jsonl", "w") as f:
     for item in train_jsonl:
         f.write(json.dumps(item) + "\n")
 
-with open("../data/val.jsonl", "w") as f:
+with open(DATA_DIR / "val.jsonl", "w") as f:
     for item in val_jsonl:
         f.write(json.dumps(item) + "\n")
 

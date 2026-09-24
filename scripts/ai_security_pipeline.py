@@ -321,6 +321,8 @@ def secure_llm_call(
 ### normal safe input
 from langchain_openai import ChatOpenAI
 import os
+from dotenv import load_dotenv
+load_dotenv()  # picks up .env from the repo root
 
 llm = ChatOpenAI(model="openai/gpt-oss-20b", base_url="https://integrate.api.nvidia.com/v1", api_key=os.environ["NVIDIA_API_KEY"])
 

@@ -5,6 +5,8 @@
 
 
 import os
+from dotenv import load_dotenv
+load_dotenv()  # picks up .env from the repo root
 from openai import OpenAI
 
 API_KEY = os.environ["NVIDIA_API_KEY"]
@@ -14,14 +16,14 @@ client = OpenAI(base_url = "https://integrate.api.nvidia.com/v1",api_key=API_KEY
 # In[2]:
 
 
-EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"   # or any NIM embedding model
+EMBED_MODEL = "nvidia/nemotron-3-embed-1b"   # or any NIM embedding model
 MODEL = "openai/gpt-oss-20b"
 
-def get_embedding(text: str):
+def get_embedding(text: str, input_type: str = "passage"):
     """Return embedding vector for a single text."""
     response = client.embeddings.create(
         model=EMBED_MODEL,
-        extra_body={"input_type": "query"}, # Use "query" or "document"
+        extra_body={"input_type": input_type},  # "passage" for documents, "query" for search queries
         input=[text]          # input is a list
     )
     return response.data[0].embedding
@@ -45,7 +47,7 @@ def hybrid_search(query, documents, embeddings, bm25_index, alpha=0.5):
     bm25_scores = bm25_index.get_scores(query.split())
     
     # Vector scores (cosine similarity)
-    query_emb = get_embedding(query)
+    query_emb = get_embedding(query, input_type="query")
     vector_scores = [cosine_similarity(query_emb, emb) for emb in embeddings]
     
     # Normalize and combine

@@ -5,6 +5,7 @@ import re
 import uuid
 from typing import Annotated, Literal, TypedDict
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ValidationError
 from openai import OpenAI
@@ -12,6 +13,8 @@ from openai import OpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
+
+load_dotenv()  # picks up .env from the repo root
 
 # ══════════════════════════════════════════════════════════
 # 1. MODEL SETUP

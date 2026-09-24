@@ -5,6 +5,9 @@
 
 
 import os, re, json
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()  # picks up .env from the repo root
 import numpy as np
 from openai import OpenAI
 from rank_bm25 import BM25Okapi
@@ -20,13 +23,13 @@ client = OpenAI(
     api_key=API_KEY,
 )
 MODEL = "openai/gpt-oss-20b"
-EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"
+EMBED_MODEL = "nvidia/nemotron-3-embed-1b"
 
 RETRY = dict(wait=wait_exponential(min=1, max=20), stop=stop_after_attempt(5))
 
 
 # ========== EMBEDDING HELPERS (batched, not one call per chunk) ==========
-# nv-embedqa-e5-v5 is an *asymmetric* embedding model: it encodes queries and
+# nemotron-3-embed-1b is an *asymmetric* embedding model: it encodes queries and
 # documents differently internally, so it requires input_type to tell it which
 # side it's embedding. Get this wrong and retrieval quality silently degrades
 # even though the code "works."
@@ -214,7 +217,7 @@ Document: {top_doc}"""
 
 # ========== MAIN PIPELINE ==========
 if __name__ == "__main__":
-    with open("../data/sample_corpus.txt", "r") as f:
+    with open(Path(__file__).resolve().parent.parent / "data" / "sample_corpus.txt", "r") as f:
         raw_text = f.read()
 
     chunks = recursive_split(raw_text, chunk_size=500, overlap=50)

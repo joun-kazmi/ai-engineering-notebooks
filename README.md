@@ -80,19 +80,32 @@ Multi-step agents on LangGraph, using incident response and support triage as th
 
 ## Running these
 
+All models are served from [NVIDIA NIM](https://build.nvidia.com)'s OpenAI-compatible endpoint (`openai/gpt-oss-20b` for chat, `nvidia/nemotron-3-embed-1b` for embeddings), so the only key you need for most of the repo is `NVIDIA_API_KEY`. The Langfuse keys are needed only for the escalation agent.
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env    # then fill in your keys
+cp .env.example .env    # then fill in NVIDIA_API_KEY
 jupyter lab
 ```
 
-Every notebook reads credentials from the environment — no keys are committed. `.env` is gitignored.
+Notebooks, scripts, and the service load `.env` from the repo root automatically (via `python-dotenv`); variables already exported in your shell take precedence. No keys are committed, and `.env` is gitignored.
 
-To run the FastAPI service:
+Scripts can be run from any directory, e.g. `python scripts/full_rag_pipeline.py`.
+
+To run the FastAPI service (from the repo root):
 
 ```bash
-uvicorn src.fastapi_serve:app --reload
+uvicorn src.fastapi_serve:app_fastapi --reload
+```
+
+`app_fastapi` is the FastAPI instance; `app` in the same module is the compiled LangGraph.
+
+To run the offline smoke tests (no API keys or LLM calls; the same suite runs in CI):
+
+```bash
+pip install pytest
+pytest -q tests
 ```
 
 ## Scope
