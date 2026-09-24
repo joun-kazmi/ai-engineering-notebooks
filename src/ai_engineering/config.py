@@ -2,15 +2,22 @@
 
 Every notebook, script, and the FastAPI service can import `get_settings()`
 instead of reading `os.environ` and hardcoding a base URL / model name
-directly. Swapping providers (NVIDIA NIM, OpenAI, Anthropic) or models then
-means editing `.env`, not the notebooks.
+directly. Swapping between OpenAI-compatible providers (NVIDIA NIM, OpenAI)
+or models then means editing `.env`, not the notebooks.
 
-    from ai_engineering.config import get_settings, make_chat_client, NO_THINK
+Provider differences beyond base URL and model name live in `ProviderAdapter`
+(`Settings.adapter`), not at call sites:
+
+    from ai_engineering.config import get_settings, make_chat_client
 
     settings = get_settings()
     client = make_chat_client(settings)
-    client.chat.completions.create(model=settings.llm_model, extra_body=NO_THINK, ...)
+    client.chat.completions.create(model=settings.resolved_model,
+                                   extra_body=settings.adapter.chat_extra_body(), ...)
 """
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -35,12 +42,33 @@ _PROVIDER_DEFAULTS = {
         "model": "gpt-4o-mini",
         "embedding_model": "text-embedding-3-small",
     },
-    "anthropic": {
-        "base_url": "https://api.anthropic.com/v1",
-        "model": "claude-sonnet-5",
-        "embedding_model": None,  # Anthropic has no embeddings endpoint
-    },
 }
+
+# Nemotron (and most reasoning-tuned NIM models) narrate their reasoning by
+# default. This is a NIM chat-template field, not part of OpenAI's schema —
+# send it via `ProviderAdapter.chat_extra_body()`, which only does so for nvidia.
+# Kept as a constant for the older NVIDIA-only notebooks that import it.
+NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+@dataclass(frozen=True)
+class ProviderAdapter:
+    """Request fields that differ between OpenAI-compatible providers.
+
+    NIM accepts extras OpenAI doesn't (and OpenAI rejects unknown request
+    arguments rather than ignoring them), so these must never be sent
+    unconditionally.
+    """
+    provider: str
+
+    def chat_extra_body(self) -> dict | None:
+        """Extra chat-completions fields: NIM's thinking switch, else nothing."""
+        return NO_THINK if self.provider == "nvidia" else None
+
+    def embedding_extra_body(self, input_type: str) -> dict | None:
+        """NIM's asymmetric embedders need `input_type` ("query" vs "passage");
+        OpenAI's embeddings are symmetric and take no such parameter."""
+        return {"input_type": input_type} if self.provider == "nvidia" else None
 
 
 class Settings(BaseSettings):
@@ -51,9 +79,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    llm_provider: Literal["nvidia", "openai", "anthropic"] = "nvidia"
+    # Only OpenAI-compatible providers: everything here goes through the
+    # OpenAI SDK (chat, tool calling, embeddings, json_schema output).
+    llm_provider: Literal["nvidia", "openai"] = "nvidia"
 
-    # Leave unset to use the provider's default (see _PROVIDER_DEFAULTS below);
+    # Leave unset to use the provider's default (see _PROVIDER_DEFAULTS above);
     # set explicitly to point at a different deployment/model without code changes.
     llm_base_url: str | None = None
     llm_model: str | None = None
@@ -61,15 +91,20 @@ class Settings(BaseSettings):
 
     nvidia_api_key: SecretStr | None = None
     openai_api_key: SecretStr | None = None
-    anthropic_api_key: SecretStr | None = None
+
+    # Client-side request pacing, shared by every client make_chat_client()
+    # builds in this process. Unset = no pacing. NIM's free tier allows about
+    # 40 requests/minute; eval runs that exceed it get 429s the SDK's short
+    # backoff can't ride out.
+    llm_max_rpm: int | None = None
 
     langfuse_public_key: SecretStr | None = None
     langfuse_secret_key: SecretStr | None = None
     langfuse_base_url: str = "https://cloud.langfuse.com"
 
     @field_validator(
-        "llm_base_url", "llm_model", "embedding_model",
-        "nvidia_api_key", "openai_api_key", "anthropic_api_key",
+        "llm_base_url", "llm_model", "embedding_model", "llm_max_rpm",
+        "nvidia_api_key", "openai_api_key",
         "langfuse_public_key", "langfuse_secret_key",
         mode="before",
     )
@@ -86,6 +121,10 @@ class Settings(BaseSettings):
         return _PROVIDER_DEFAULTS[self.llm_provider]
 
     @property
+    def adapter(self) -> ProviderAdapter:
+        return ProviderAdapter(self.llm_provider)
+
+    @property
     def resolved_base_url(self) -> str:
         return self.llm_base_url or self._defaults["base_url"]
 
@@ -94,16 +133,12 @@ class Settings(BaseSettings):
         return self.llm_model or self._defaults["model"]
 
     @property
-    def resolved_embedding_model(self) -> str | None:
+    def resolved_embedding_model(self) -> str:
         return self.embedding_model or self._defaults["embedding_model"]
 
     @property
     def api_key(self) -> SecretStr | None:
-        return {
-            "nvidia": self.nvidia_api_key,
-            "openai": self.openai_api_key,
-            "anthropic": self.anthropic_api_key,
-        }[self.llm_provider]
+        return {"nvidia": self.nvidia_api_key, "openai": self.openai_api_key}[self.llm_provider]
 
     @property
     def has_llm_credentials(self) -> bool:
@@ -131,30 +166,67 @@ def get_settings() -> "Settings":
     return Settings()
 
 
-# Nemotron (and most reasoning-tuned NIM models) narrate their reasoning by
-# default; every direct-answer call in this repo passes this to suppress it.
-# Harmless no-op on providers that don't recognize the field.
-NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
+class RateLimiter:
+    """Spaces requests at least 60/rpm seconds apart. Thread-safe. Keeps a
+    running total of time spent waiting so latency measurements can exclude
+    self-imposed pacing (see `pacing_wait_seconds`)."""
+
+    def __init__(self, rpm: int):
+        self.interval = 60.0 / rpm
+        self.waited = 0.0
+        self._next = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self, *_):  # usable directly as an httpx request event hook
+        with self._lock:
+            now = time.monotonic()
+            delay = self._next - now
+            self._next = max(now, self._next) + self.interval
+            if delay > 0:
+                self.waited += delay
+        if delay > 0:
+            time.sleep(delay)
 
 
-def make_chat_client(settings: "Settings | None" = None, max_retries: int = 2):
+_limiters: dict[int, RateLimiter] = {}
+
+
+def pacing_wait_seconds() -> float:
+    """Total time this process has spent in client-side pacing. Take a delta
+    around a timed block and subtract it to report provider latency only."""
+    return sum(lim.waited for lim in _limiters.values())
+
+
+def paced_http_client(rpm: int | None):
+    """An httpx client whose every request — SDK retries included — passes
+    through one process-wide RateLimiter per rpm value, so separate OpenAI
+    clients (chat, embeddings, a judge) share a single budget. None = no pacing."""
+    if not rpm:
+        return None
+    import httpx
+
+    limiter = _limiters.setdefault(rpm, RateLimiter(rpm))
+    return httpx.Client(event_hooks={"request": [limiter.wait]}, timeout=httpx.Timeout(120.0, connect=10.0))
+
+
+def make_chat_client(settings: "Settings | None" = None, max_retries: int = 2, max_rpm: int | None = None,
+                     client_cls=None):
     """OpenAI-compatible client (chat + embeddings) for the configured provider.
 
     `max_retries` is the SDK's own exponential backoff on 408/409/429/5xx and
     connection errors. Eval harnesses that make hundreds of calls should raise
     it — hosted NIM endpoints return transient 503 "overloaded" often enough
-    that one unlucky call otherwise kills a whole run.
-
-    Anthropic's API isn't OpenAI-compatible for tool calling / embeddings, so
-    this raises for llm_provider="anthropic" — use langchain-anthropic or the
-    Anthropic SDK directly for that provider instead.
+    that one unlucky call otherwise kills a whole run. `max_rpm` (default:
+    LLM_MAX_RPM) paces requests client-side so a long run doesn't hit 429s in
+    the first place. `client_cls` swaps in a drop-in wrapper such as
+    `langfuse.openai.OpenAI`.
     """
-    from openai import OpenAI
+    if client_cls is None:
+        from openai import OpenAI as client_cls
 
     s = settings or get_settings()
-    if s.llm_provider == "anthropic":
-        raise ValueError(
-            "make_chat_client() only supports OpenAI-compatible providers (nvidia, openai). "
-            "Use the Anthropic SDK or langchain-anthropic directly for llm_provider='anthropic'."
-        )
-    return OpenAI(base_url=s.resolved_base_url, api_key=s.require_api_key(), max_retries=max_retries)
+    kwargs = {}
+    http_client = paced_http_client(max_rpm or s.llm_max_rpm)
+    if http_client is not None:
+        kwargs["http_client"] = http_client
+    return client_cls(base_url=s.resolved_base_url, api_key=s.require_api_key(), max_retries=max_retries, **kwargs)

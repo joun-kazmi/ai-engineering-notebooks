@@ -12,6 +12,7 @@ from ai_engineering.rag_eval import (
     HybridRrfRetriever,
     OfflineEmbedder,
     OfflineReranker,
+    faithfulness_from_claims,
     load_corpus,
     load_queries,
     ndcg_at_k,
@@ -57,11 +58,26 @@ def test_rrf_ranks_start_at_one_and_reward_agreement():
     assert rrf_fuse([[3]], rrf_k=60) == [3]
 
 
-def test_parse_rerank_scores_handles_fences_strings_and_junk():
-    raw = '```json\n[{"id": "1", "score": 9}, {"id": 0, "score": 2}, {"id": 5, "score": 10}, {"id": 1, "score": 1}]\n```'
-    assert parse_rerank_scores(raw, n_candidates=3) == [(1, 9.0), (0, 2.0)]
-    assert parse_rerank_scores("I think doc 2 is best", n_candidates=3) is None
-    assert parse_rerank_scores("[]", n_candidates=3) is None
+def test_parse_rerank_scores_accepts_complete_in_range_replies():
+    raw = '```json\n[{"id": "1", "score": 9}, {"id": 0, "score": 2.5}, {"id": 2, "score": 0}]\n```'
+    assert parse_rerank_scores(raw, n_candidates=3) == ("ok", [(1, 9.0), (0, 2.5), (2, 0.0)])
+
+
+def test_parse_rerank_scores_rejects_partial_duplicate_and_out_of_range():
+    assert parse_rerank_scores('[{"id": 1, "score": 10}]', 3)[0] == "partial"
+    assert parse_rerank_scores('[{"id": 0, "score": 1}, {"id": 0, "score": 2}, {"id": 1, "score": 3}]', 3)[0] == "partial"
+    assert parse_rerank_scores('[{"id": 0, "score": 1}, {"id": 1, "score": 2}, {"id": 5, "score": 3}]', 3)[0] == "partial"
+    assert parse_rerank_scores('[{"id": 0, "score": 900}, {"id": 1, "score": 2}, {"id": 2, "score": 3}]', 3)[0] == "invalid_scores"
+    assert parse_rerank_scores('[{"id": 0}, {"id": 1, "score": 2}, {"id": 2, "score": 3}]', 3)[0] == "invalid_scores"
+    assert parse_rerank_scores("I think doc 2 is best", 3)[0] == "unparseable"
+    assert parse_rerank_scores("[]", 3)[0] == "unparseable"
+
+
+def test_faithfulness_is_derived_from_claims():
+    assert faithfulness_from_claims([{"supported": True}, {"supported": True}]) is True
+    assert faithfulness_from_claims([{"supported": True}, {"supported": False}]) is False
+    assert faithfulness_from_claims([{"supported": "yes"}]) is False  # only a real boolean counts
+    assert faithfulness_from_claims([]) is None
 
 
 def test_query_set_is_internally_consistent_with_the_corpus():
@@ -92,11 +108,12 @@ def test_offline_benchmark_runs_end_to_end_and_is_deterministic():
         bm25 = Bm25Retriever(documents)
         dense = DenseRetriever(documents, OfflineEmbedder())
         retrievers = {"bm25": bm25, "dense": dense, "hybrid_rrf": HybridRrfRetriever(bm25, dense)}
-        rows, per_query = run_benchmark(documents, queries, retrievers, OfflineReranker(), k=5)
+        rows, per_query, _ = run_benchmark(documents, queries, retrievers, OfflineReranker(), k=5)
         return [{k: v for k, v in r.items() if "latency" not in k} for r in rows], per_query
 
     rows, per_query = once()
     assert [r["method"] for r in rows] == ["bm25", "dense", "hybrid_rrf", "hybrid_rrf+rerank"]
     assert len(per_query) == len(queries)
     assert all(0.0 <= r["recall@5"] <= 1.0 for r in rows)
+    assert all(r["embed_tok/q"] == 0 and r["llm_tok/q"] == 0 for r in rows)  # offline: no API tokens
     assert rows == once()[0]

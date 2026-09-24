@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 # imports ai_engineering.config: real env vars beat .env in pydantic-settings,
 # and the config treats a blank key as unset, so a developer's exported
 # NVIDIA_API_KEY can't silently turn the suite into live (paid, flaky) calls.
-for key in ("NVIDIA_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+for key in ("NVIDIA_API_KEY", "OPENAI_API_KEY",
             "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"):
     os.environ[key] = ""
 os.environ["LLM_PROVIDER"] = "nvidia"

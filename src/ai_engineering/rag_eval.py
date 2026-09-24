@@ -15,7 +15,9 @@ Runs two ways:
     embedding model, an LLM reranker, and an LLM faithfulness judge.
 
 Metrics: Recall@K, MRR, nDCG@K (retrieval quality), per-query latency,
-token cost for the LLM-touching stages, and answer faithfulness (live only).
+query-time tokens split into embedding and LLM tokens (indexing tokens are
+reported separately, since they're paid once), and answer faithfulness
+(live only).
 """
 import hashlib
 import json
@@ -28,7 +30,7 @@ from pathlib import Path
 import numpy as np
 from rank_bm25 import BM25Okapi
 
-from ai_engineering.config import NO_THINK, get_settings, make_chat_client
+from ai_engineering.config import get_settings, make_chat_client, pacing_wait_seconds
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
@@ -38,9 +40,10 @@ DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 # usage numbers returned by the API.
 ASSUMED_USD_PER_1K_TOKENS = 0.002
 
-# Every live call in a benchmark run goes through one of these; hosted NIM
-# returns transient 503s often enough that the SDK default of 2 isn't enough.
-EVAL_MAX_RETRIES = 6
+# Every live call in a benchmark run goes through these: more SDK retries for
+# NIM's transient 503s, and client-side pacing under its ~40 req/min limit.
+EVAL_MAX_RETRIES = 20
+EVAL_MAX_RPM = get_settings().llm_max_rpm or 30
 
 
 def tokenize(text: str) -> list[str]:
@@ -94,36 +97,52 @@ def rrf_fuse(rankings: list[list[int]], rrf_k: int = 60) -> list[int]:
     return sorted(fused, key=fused.get, reverse=True)
 
 
-def parse_rerank_scores(raw: str, n_candidates: int) -> list[tuple[int, float]] | None:
-    """Parse an LLM reranker reply into (candidate_index, score) pairs.
+RERANK_SCORE_RANGE = (0.0, 10.0)
 
-    Returns None when the reply isn't a usable JSON array, so the caller can
-    count it as a parse failure instead of silently scoring it as a ranking.
-    Ids may come back as ints or numeric strings; out-of-range, negative, or
-    duplicate ids are dropped.
+
+def parse_rerank_scores(raw: str, n_candidates: int) -> tuple[str, list[tuple[int, float]]]:
+    """Parse an LLM reranker reply into (status, [(candidate_index, score)]).
+
+    status is one of:
+      "ok"             every candidate scored exactly once, all scores in range
+      "partial"        valid JSON, but some candidates missing (or duplicated)
+      "invalid_scores" a score outside RERANK_SCORE_RANGE, or a non-numeric one
+      "unparseable"    no usable JSON array of {"id", "score"} objects
+
+    Only "ok" should be used as a ranking. Anything else means the judge
+    didn't do what it was asked; treating a one-item reply as a full ranking
+    would silently rank the other candidates last.
     """
     text = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
     match = re.search(r"\[.*\]", text, re.DOTALL)
     if not match:
-        return None
+        return "unparseable", []
     try:
         items = json.loads(match.group(0))
     except json.JSONDecodeError:
-        return None
-    if not isinstance(items, list):
-        return None
-    pairs, seen = [], set()
+        return "unparseable", []
+    if not isinstance(items, list) or not items:
+        return "unparseable", []
+    pairs, ids = [], []
+    lo, hi = RERANK_SCORE_RANGE
     for item in items:
-        if not isinstance(item, dict):
-            continue
+        if not isinstance(item, dict) or "id" not in item:
+            return "unparseable", []
         try:
-            idx, score = int(item["id"]), float(item.get("score", 0))
+            idx = int(item["id"])
+        except (TypeError, ValueError):
+            return "unparseable", []
+        try:
+            score = float(item["score"])
         except (KeyError, TypeError, ValueError):
-            continue
-        if 0 <= idx < n_candidates and idx not in seen:
-            seen.add(idx)
-            pairs.append((idx, score))
-    return pairs or None
+            return "invalid_scores", []
+        if not lo <= score <= hi:
+            return "invalid_scores", []
+        ids.append(idx)
+        pairs.append((idx, score))
+    if sorted(ids) != list(range(n_candidates)):
+        return "partial", []
+    return "ok", pairs
 
 
 # ========== EMBEDDERS ==========
@@ -138,6 +157,7 @@ class OfflineEmbedder:
     """
     name = "offline-hashed-bow (NOT a real embedding model)"
     dims = 256
+    tokens_used = 0  # no API, no tokens
 
     @staticmethod
     def _stable_hash(token: str) -> int:
@@ -161,15 +181,18 @@ class LiveEmbedder:
 
     def __init__(self, settings=None):
         self.settings = settings or get_settings()
-        self.client = make_chat_client(self.settings, max_retries=EVAL_MAX_RETRIES)
+        self.client = make_chat_client(self.settings, EVAL_MAX_RETRIES, EVAL_MAX_RPM)
         self.name = self.settings.resolved_embedding_model
+        self.tokens_used = 0  # running total of API-reported embedding tokens
 
     def embed(self, texts: list[str], input_type: str = "passage") -> list[list[float]]:
         resp = self.client.embeddings.create(
             model=self.settings.resolved_embedding_model,
             input=texts,
-            extra_body={"input_type": input_type},
+            extra_body=self.settings.adapter.embedding_extra_body(input_type),
         )
+        if resp.usage:
+            self.tokens_used += resp.usage.total_tokens
         return [d.embedding for d in resp.data]
 
 
@@ -198,7 +221,9 @@ class DenseRetriever:
     def __init__(self, documents: list[str], embedder):
         self.documents = documents
         self.embedder = embedder
+        before = embedder.tokens_used
         self.doc_embeddings = embedder.embed(documents, input_type="passage")
+        self.index_tokens = embedder.tokens_used - before  # one-time cost, not per query
 
     def retrieve(self, query: str, k: int) -> list[int]:
         q_emb = self.embedder.embed([query], input_type="query")[0]
@@ -225,7 +250,7 @@ class HybridRrfRetriever:
 class RerankOutcome:
     ranked_ids: list[int]
     tokens: int = 0
-    parse_failed: bool = False
+    status: str = "ok"  # see parse_rerank_scores
 
 
 class OfflineReranker:
@@ -241,7 +266,7 @@ class OfflineReranker:
 class LlmReranker:
     def __init__(self, settings=None):
         self.settings = settings or get_settings()
-        self.client = make_chat_client(self.settings, max_retries=EVAL_MAX_RETRIES)
+        self.client = make_chat_client(self.settings, EVAL_MAX_RETRIES, EVAL_MAX_RPM)
         self.name = f"llm-judge ({self.settings.resolved_model})"
 
     def rerank(self, query, candidate_ids, documents, top_k) -> RerankOutcome:
@@ -253,20 +278,20 @@ class LlmReranker:
         )
         resp = self.client.chat.completions.create(
             model=self.settings.resolved_model,
-            extra_body=NO_THINK,
+            extra_body=self.settings.adapter.chat_extra_body(),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=600,
             temperature=0,
         )
         tokens = resp.usage.total_tokens if resp.usage else 0
-        pairs = parse_rerank_scores(resp.choices[0].message.content or "", len(candidate_ids))
-        if pairs is None:
-            # Fall back to the retriever's order, but record it — a reranker
+        status, pairs = parse_rerank_scores(resp.choices[0].message.content or "", len(candidate_ids))
+        if status != "ok":
+            # Fall back to the retriever's order, but record why — a reranker
             # that silently fails looks exactly like one that agrees.
-            return RerankOutcome(candidate_ids[:top_k], tokens, parse_failed=True)
-        # Stable sort: ties keep the retriever's order; unscored candidates go last.
+            return RerankOutcome(candidate_ids[:top_k], tokens, status)
+        # Stable sort: ties keep the retriever's order.
         scores = dict(pairs)
-        order = sorted(range(len(candidate_ids)), key=lambda i: -scores.get(i, -1))
+        order = sorted(range(len(candidate_ids)), key=lambda i: -scores[i])
         return RerankOutcome([candidate_ids[i] for i in order][:top_k], tokens)
 
 
@@ -279,18 +304,23 @@ class MethodResult:
     mrr: list[float] = field(default_factory=list)
     ndcg_at_5: list[float] = field(default_factory=list)
     latency_ms: list[float] = field(default_factory=list)
-    tokens: list[int] = field(default_factory=list)
-    parse_failures: int = 0
+    embed_tokens: list[int] = field(default_factory=list)  # query embeddings, per query
+    llm_tokens: list[int] = field(default_factory=list)    # reranker calls, per query
+    rerank_status: dict[str, int] = field(default_factory=dict)
 
-    def add(self, ranked: list[int], relevant: set[int], k: int, elapsed_ms: float) -> None:
+    def add(self, ranked, relevant, k, elapsed_ms, embed_tokens=0, llm_tokens=0) -> None:
         self.recall_at_5.append(recall_at_k(ranked, relevant, k))
         self.mrr.append(reciprocal_rank(ranked, relevant))
         self.ndcg_at_5.append(ndcg_at_k(ranked, relevant, k))
         self.latency_ms.append(elapsed_ms)
+        self.embed_tokens.append(embed_tokens)
+        self.llm_tokens.append(llm_tokens)
 
     def summary(self) -> dict:
         avg = lambda xs: sum(xs) / len(xs) if xs else 0.0
         pct = lambda p: round(float(np.percentile(self.latency_ms, p)), 1) if self.latency_ms else 0.0
+        total = sum(self.embed_tokens) + sum(self.llm_tokens)
+        n = len(self.latency_ms) or 1
         return {
             "method": self.method,
             "recall@5": round(avg(self.recall_at_5), 3),
@@ -298,18 +328,27 @@ class MethodResult:
             "ndcg@5": round(avg(self.ndcg_at_5), 3),
             "p50_latency_ms": pct(50),
             "p95_latency_ms": pct(95),
-            "tokens": sum(self.tokens),
-            "est_cost_usd": round(sum(self.tokens) / 1000 * ASSUMED_USD_PER_1K_TOKENS, 4),
-            "parse_failures": self.parse_failures,
+            "embed_tok/q": round(sum(self.embed_tokens) / n, 1),
+            "llm_tok/q": round(sum(self.llm_tokens) / n, 1),
+            "est_usd/1k_q": round(total / n * ASSUMED_USD_PER_1K_TOKENS, 4),
+            "rerank_fallbacks": sum(v for k, v in self.rerank_status.items() if k != "ok"),
         }
+
+
+def _elapsed_ms(start: float, paced0: float) -> float:
+    """Wall time since `start`, minus any client-side pacing waits in between,
+    so latency reflects the provider, not our own rate limiting."""
+    return ((time.perf_counter() - start) - (pacing_wait_seconds() - paced0)) * 1000
 
 
 def run_benchmark(documents, queries, retrievers: dict, reranker, k: int = 5, shortlist: int = 10):
     """Returns (summary rows, per-query rows). The rerank stage reranks the
-    hybrid retriever's top-`shortlist`, and its latency includes that
-    retrieval, so the latency column is end to end for every method."""
+    hybrid retriever's top-`shortlist`, and its latency and embedding tokens
+    include that retrieval, so both columns are end to end for every method.
+    Token columns are query-time only; indexing is `DenseRetriever.index_tokens`."""
     methods = list(retrievers) + ["hybrid_rrf+rerank"]
     results = {name: MethodResult(name) for name in methods}
+    embedder = retrievers["dense"].embedder
     per_query = []
 
     for q in queries:
@@ -317,23 +356,24 @@ def run_benchmark(documents, queries, retrievers: dict, reranker, k: int = 5, sh
         row = {"id": q["id"], "category": q["category"]}
 
         for name, retriever in retrievers.items():
-            start = time.perf_counter()
+            tok0, paced0, start = embedder.tokens_used, pacing_wait_seconds(), time.perf_counter()
             ranked = retriever.retrieve(q["query"], k)
-            results[name].add(ranked, relevant, k, (time.perf_counter() - start) * 1000)
+            results[name].add(ranked, relevant, k, _elapsed_ms(start, paced0),
+                              embed_tokens=embedder.tokens_used - tok0)
             row[name] = results[name].recall_at_5[-1]
 
-        start = time.perf_counter()
+        tok0, paced0, start = embedder.tokens_used, pacing_wait_seconds(), time.perf_counter()
         candidates = retrievers["hybrid_rrf"].retrieve(q["query"], k=shortlist)
         outcome = reranker.rerank(q["query"], candidates, documents, top_k=k)
         r = results["hybrid_rrf+rerank"]
-        r.add(outcome.ranked_ids, relevant, k, (time.perf_counter() - start) * 1000)
-        r.tokens.append(outcome.tokens)
-        r.parse_failures += outcome.parse_failed
+        r.add(outcome.ranked_ids, relevant, k, _elapsed_ms(start, paced0),
+              embed_tokens=embedder.tokens_used - tok0, llm_tokens=outcome.tokens)
+        r.rerank_status[outcome.status] = r.rerank_status.get(outcome.status, 0) + 1
         row["hybrid_rrf+rerank"] = r.recall_at_5[-1]
         row["_reranked"] = outcome.ranked_ids
         per_query.append(row)
 
-    return [results[m].summary() for m in methods], per_query
+    return [results[m].summary() for m in methods], per_query, results["hybrid_rrf+rerank"].rerank_status
 
 
 def recall_by_category(per_query: list[dict], methods: list[str]) -> list[dict]:
@@ -347,6 +387,14 @@ def recall_by_category(per_query: list[dict], methods: list[str]) -> list[dict]:
 
 # ========== FAITHFULNESS (live only) ==========
 
+def faithfulness_from_claims(claims: list[dict]) -> bool | None:
+    """True iff there is at least one claim and every claim is supported;
+    None when the judge produced no usable claims."""
+    if not claims:
+        return None
+    return all(c.get("supported") is True for c in claims)
+
+
 class FaithfulnessJudge:
     """Generates an answer from the retrieved context, then asks a judge call
     whether every claim in it is supported by that context.
@@ -358,11 +406,11 @@ class FaithfulnessJudge:
 
     def __init__(self, settings=None):
         self.settings = settings or get_settings()
-        self.client = make_chat_client(self.settings, max_retries=EVAL_MAX_RETRIES)
+        self.client = make_chat_client(self.settings, EVAL_MAX_RETRIES, EVAL_MAX_RPM)
 
     def _chat(self, prompt: str, max_tokens: int) -> tuple[str, int]:
         resp = self.client.chat.completions.create(
-            model=self.settings.resolved_model, extra_body=NO_THINK,
+            model=self.settings.resolved_model, extra_body=self.settings.adapter.chat_extra_body(),
             messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=0,
         )
         return resp.choices[0].message.content or "", resp.usage.total_tokens if resp.usage else 0
@@ -375,8 +423,7 @@ class FaithfulnessJudge:
         verdict_raw, t2 = self._chat(
             "You are checking an answer for faithfulness to its context.\n"
             "List every factual claim in the ANSWER and mark whether the CONTEXT supports it.\n"
-            'Return ONLY JSON: {"claims": [{"claim": "...", "supported": true}], "faithful": true}\n'
-            "faithful is true only if every claim is supported.\n\n"
+            'Return ONLY JSON: {"claims": [{"claim": "...", "supported": true}]}\n\n'
             f"CONTEXT:\n{ctx}\n\nANSWER:\n{answer}", 600)
         text = re.sub(r"^```(?:json)?|```$", "", verdict_raw.strip(), flags=re.M).strip()
         m = re.search(r"\{.*\}", text, re.DOTALL)
@@ -384,11 +431,14 @@ class FaithfulnessJudge:
             verdict = json.loads(m.group(0)) if m else None
         except json.JSONDecodeError:
             verdict = None
-        claims = verdict.get("claims", []) if isinstance(verdict, dict) else []
-        supported = sum(bool(c.get("supported")) for c in claims if isinstance(c, dict))
+        claims = [c for c in verdict.get("claims", []) if isinstance(c, dict)] if isinstance(verdict, dict) else []
+        supported = sum(c.get("supported") is True for c in claims)
         return {
             "answer": answer.strip(),
-            "faithful": bool(verdict.get("faithful")) if isinstance(verdict, dict) else None,
+            # Derived from the claim list, never the judge's own summary flag,
+            # so the verdict can't contradict the claims it's based on. No
+            # claims at all (unparseable or empty reply) is "unjudged", not faithful.
+            "faithful": faithfulness_from_claims(claims),
             "claims": len(claims),
             "supported_claims": supported,
             "tokens": t1 + t2,

@@ -14,7 +14,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ai_engineering.config import NO_THINK, get_settings, make_chat_client
+from ai_engineering.config import get_settings, make_chat_client
 
 # ══════════════════════════════════════════════════════════
 # 1. MODEL SETUP
@@ -22,6 +22,8 @@ from ai_engineering.config import NO_THINK, get_settings, make_chat_client
 _settings = get_settings()
 llm_client = make_chat_client(_settings)
 RAW_MODEL = _settings.resolved_model
+# NIM's thinking switch on nvidia, nothing on OpenAI (which rejects unknown fields)
+CHAT_EXTRA = _settings.adapter.chat_extra_body()
 
 # ══════════════════════════════════════════════════════════
 # 2. RELIABILITY HELPER (Schema-injected)
@@ -42,7 +44,7 @@ def llm_structured(prompt: str, schema, max_retries: int = 3):
         if feedback:
             full_prompt += f"\n\nYour previous output FAILED validation:\n{feedback}\nFix these issues."
         
-        raw = llm_client.chat.completions.create(model=RAW_MODEL, extra_body=NO_THINK, messages=[{"role": "user", "content": full_prompt}], response_format=response_format).choices[0].message.content or ""
+        raw = llm_client.chat.completions.create(model=RAW_MODEL, extra_body=CHAT_EXTRA, messages=[{"role": "user", "content": full_prompt}], response_format=response_format).choices[0].message.content or ""
         raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         if not raw.startswith("{"):
             match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -88,7 +90,7 @@ RAW_TOOLS = [
 def run_investigation(task: str, max_iterations: int = 8) -> str:
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task}]
     for _ in range(max_iterations):
-        resp = llm_client.chat.completions.create(model=RAW_MODEL, extra_body=NO_THINK, messages=messages, tools=RAW_TOOLS, tool_choice="auto")
+        resp = llm_client.chat.completions.create(model=RAW_MODEL, extra_body=CHAT_EXTRA, messages=messages, tools=RAW_TOOLS, tool_choice="auto")
         msg = resp.choices[0].message
         assistant_msg = {"role": "assistant", "content": msg.content or ""}
         if msg.tool_calls:
@@ -214,7 +216,7 @@ class ApprovalPayload(BaseModel):
 async def generate(req: GenerateRequest):
     response = llm_client.chat.completions.create(
         model=RAW_MODEL,
-        extra_body=NO_THINK,
+        extra_body=CHAT_EXTRA,
         messages=[{"role": "user", "content": req.prompt}],
         max_tokens=200,
         temperature=0.3

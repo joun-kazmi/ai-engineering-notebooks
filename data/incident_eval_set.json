@@ -1,44 +1,257 @@
 [
   {
     "id": "inc01",
+    "service": "payments-api",
     "alert": "payments-api error rate 31% since 10:42, users can't checkout",
     "expected_severity": "SEV1",
-    "expected_action": "rollback_deploy"
+    "expected_action": "rollback_deploy",
+    "rationale": "Runbook rule 1: errors >10% starting 9 minutes after deploy v2.14.3.",
+    "fixtures": {
+      "logs": [
+        "10:42:03 ERROR payments-api: NullPointerException in ChargeHandler.apply (build v2.14.3)",
+        "10:42:07 ERROR payments-api: 500 on POST /charges",
+        "10:43:10 INFO payments-api: health check ok"
+      ],
+      "deploys": [
+        {
+          "version": "v2.14.3",
+          "minutes_ago": 9,
+          "author": "dana"
+        }
+      ],
+      "metrics": {
+        "error_rate": 0.31,
+        "p95_latency_ms": 900,
+        "slo_p95_ms": 800,
+        "replicas_healthy": "6/6"
+      },
+      "dependencies": [
+        {
+          "name": "postgres-primary",
+          "owner": "db-team",
+          "status": "healthy"
+        },
+        {
+          "name": "card-gateway",
+          "owner": "partner-integrations",
+          "status": "healthy"
+        }
+      ]
+    }
   },
   {
     "id": "inc02",
+    "service": "checkout-api",
     "alert": "checkout-api p95 latency critical, timeouts spiking, revenue impact",
     "expected_severity": "SEV1",
-    "expected_action": "rollback_deploy"
+    "expected_action": "page_oncall",
+    "rationale": "Runbook rule 2: postgres-primary (db-team) saturated; last deploy 3 days ago, so not rule 1.",
+    "fixtures": {
+      "logs": [
+        "14:02:11 ERROR checkout-api: timeout acquiring connection from pool after 5000ms",
+        "14:02:15 ERROR checkout-api: timeout acquiring connection from pool after 5000ms"
+      ],
+      "deploys": [
+        {
+          "version": "v5.2.0",
+          "minutes_ago": 4320,
+          "author": "lee"
+        }
+      ],
+      "metrics": {
+        "error_rate": 0.08,
+        "p95_latency_ms": 6200,
+        "slo_p95_ms": 1000,
+        "replicas_healthy": "8/8"
+      },
+      "dependencies": [
+        {
+          "name": "postgres-primary",
+          "owner": "db-team",
+          "status": "saturated: 100% CPU, 480 active queries"
+        }
+      ]
+    }
   },
   {
     "id": "inc03",
+    "service": "auth-service",
     "alert": "auth-service latency slightly up, no user impact",
     "expected_severity": "SEV3",
-    "expected_action": null
+    "expected_action": "close",
+    "rationale": "No customer impact: close at triage.",
+    "fixtures": {
+      "logs": [],
+      "deploys": [],
+      "metrics": {
+        "error_rate": 0.001,
+        "p95_latency_ms": 120,
+        "slo_p95_ms": 300,
+        "replicas_healthy": "4/4"
+      },
+      "dependencies": []
+    }
   },
   {
     "id": "inc04",
+    "service": "payments-api",
     "alert": "payments-api connection pool exhausted, error rate climbing after last deploy",
     "expected_severity": "SEV2",
-    "expected_action": "rollback_deploy"
+    "expected_action": "rollback_deploy",
+    "rationale": "Runbook rule 1: v2.15.0 deployed 22 minutes ago leaks connections; errors at 14%.",
+    "fixtures": {
+      "logs": [
+        "09:14:40 WARN payments-api: connection not returned to pool by RefundHandler (build v2.15.0)",
+        "09:15:02 ERROR payments-api: pool exhausted (100/100 in use)"
+      ],
+      "deploys": [
+        {
+          "version": "v2.15.0",
+          "minutes_ago": 22,
+          "author": "priya"
+        }
+      ],
+      "metrics": {
+        "error_rate": 0.14,
+        "p95_latency_ms": 2100,
+        "slo_p95_ms": 800,
+        "replicas_healthy": "6/6"
+      },
+      "dependencies": [
+        {
+          "name": "postgres-primary",
+          "owner": "db-team",
+          "status": "healthy"
+        }
+      ]
+    }
   },
   {
     "id": "inc05",
-    "alert": "auth-service background job queue backed up, no customer-facing errors yet",
-    "expected_severity": "SEV3",
-    "expected_action": null
+    "service": "notifications-service",
+    "alert": "notifications-service email queue backed up, customer emails delayed",
+    "expected_severity": "SEV2",
+    "expected_action": "restart_service",
+    "rationale": "Runbook rule 3: worker-3 stuck (no heartbeat 25 min), the other 3 workers healthy, no recent deploy.",
+    "fixtures": {
+      "logs": [
+        "11:05:00 WARN notifications-service: worker-3 no heartbeat for 25m, last line 'processing batch 88121'",
+        "11:05:02 INFO notifications-service: worker-1 processed batch 88410",
+        "11:05:03 INFO notifications-service: worker-2 processed batch 88411"
+      ],
+      "deploys": [
+        {
+          "version": "v1.9.4",
+          "minutes_ago": 2880,
+          "author": "ana"
+        }
+      ],
+      "metrics": {
+        "error_rate": 0.0,
+        "p95_latency_ms": 40,
+        "slo_p95_ms": 500,
+        "replicas_healthy": "3/4",
+        "queue_depth": 48210
+      },
+      "dependencies": [
+        {
+          "name": "smtp-relay",
+          "owner": "infra-team",
+          "status": "healthy"
+        }
+      ]
+    }
   },
   {
     "id": "inc06",
-    "alert": "payments-api completely down, all card charges failing, revenue impact",
-    "expected_severity": "SEV1",
-    "expected_action": "rollback_deploy"
+    "service": "search-api",
+    "alert": "search-api error rate 2% and rising slowly, some users report slow search",
+    "expected_severity": "SEV2",
+    "expected_action": "monitor",
+    "rationale": "Runbook rule 4: error rate 2.1% (<5%) and p95 610ms inside the 800ms SLO; deploy 25h ago; deps healthy.",
+    "fixtures": {
+      "logs": [
+        "16:20:31 WARN search-api: slow query 450ms on index products_v7",
+        "16:21:02 ERROR search-api: request timeout (1 of 48 in window)"
+      ],
+      "deploys": [
+        {
+          "version": "v3.4.1",
+          "minutes_ago": 1500,
+          "author": "omar"
+        }
+      ],
+      "metrics": {
+        "error_rate": 0.021,
+        "p95_latency_ms": 610,
+        "slo_p95_ms": 800,
+        "replicas_healthy": "5/5"
+      },
+      "dependencies": [
+        {
+          "name": "elasticsearch",
+          "owner": "search-team",
+          "status": "healthy"
+        }
+      ]
+    }
   },
   {
     "id": "inc07",
+    "service": "auth-service",
     "alert": "auth-service TLS certificate expires in 21 days, renewal ticket already open",
     "expected_severity": "SEV3",
-    "expected_action": null
+    "expected_action": "close",
+    "rationale": "No customer impact yet: close at triage.",
+    "fixtures": {
+      "logs": [],
+      "deploys": [],
+      "metrics": {
+        "error_rate": 0.0,
+        "p95_latency_ms": 110,
+        "slo_p95_ms": 300,
+        "replicas_healthy": "4/4"
+      },
+      "dependencies": []
+    }
+  },
+  {
+    "id": "inc08",
+    "service": "checkout-api",
+    "alert": "checkout-api 12% of card payments failing with upstream 503s, revenue impact",
+    "expected_severity": "SEV1",
+    "expected_action": "page_oncall",
+    "rationale": "Runbook rule 2: card-gateway (partner-integrations) degraded; checkout-api's last deploy was 3 days ago, so rollback wouldn't help.",
+    "fixtures": {
+      "logs": [
+        "14:06:12 ERROR checkout-api: card-gateway returned 503 Service Unavailable",
+        "14:06:14 ERROR checkout-api: card-gateway returned 503 Service Unavailable"
+      ],
+      "deploys": [
+        {
+          "version": "v5.2.0",
+          "minutes_ago": 4320,
+          "author": "lee"
+        }
+      ],
+      "metrics": {
+        "error_rate": 0.12,
+        "p95_latency_ms": 1400,
+        "slo_p95_ms": 1000,
+        "replicas_healthy": "8/8"
+      },
+      "dependencies": [
+        {
+          "name": "postgres-primary",
+          "owner": "db-team",
+          "status": "healthy"
+        },
+        {
+          "name": "card-gateway",
+          "owner": "partner-integrations",
+          "status": "degraded: 503s since 14:05"
+        }
+      ]
+    }
   }
 ]

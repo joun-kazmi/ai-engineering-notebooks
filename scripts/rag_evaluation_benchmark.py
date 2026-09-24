@@ -14,7 +14,7 @@
 # | `hybrid_rrf` | BM25 + dense fused with Reciprocal Rank Fusion |
 # | `hybrid_rrf+rerank` | Hybrid top-10 reranked by an LLM judge (`nemotron-3-super`) |
 # 
-# Metrics: Recall@5, MRR, nDCG@5, end-to-end p50/p95 latency, tokens, and answer faithfulness for the best pipeline.
+# Metrics: Recall@5, MRR, nDCG@5, end-to-end p50/p95 latency, query-time tokens (embedding and LLM, separately), and answer faithfulness for the best pipeline.
 # 
 # The library code (metrics, retrievers, reranker, judge) lives in [`src/ai_engineering/rag_eval.py`](../../src/ai_engineering/rag_eval.py) so it can be unit tested; this notebook runs it and reads the results.
 
@@ -73,13 +73,16 @@ print("Reranker:", reranker.name)
 
 bm25 = re_.Bm25Retriever(documents)
 dense = re_.DenseRetriever(documents, embedder)   # embeds the corpus once, up front
+print(f"Indexing (one-time): {len(documents)} passages, {dense.index_tokens} embedding tokens")
 hybrid = re_.HybridRrfRetriever(bm25, dense)
 retrievers = {"bm25": bm25, "dense": dense, "hybrid_rrf": hybrid}
 
 
 # ## Run the benchmark
 # 
-# Latency is end to end per query: the dense side includes the query-embedding API call, and the rerank row includes the hybrid retrieval that produced its shortlist. `parse_failures` counts reranker replies that weren't usable JSON; those fall back to the hybrid order, and are counted so a silently failing reranker can't pass as one that agrees.
+# Latency and tokens are end to end per query. The dense side includes the query-embedding call, and the rerank row includes the hybrid retrieval that produced its shortlist. Latency excludes the client-side pacing used to stay under the endpoint's rate limit. Tokens are split into `embed_tok/q` (query embeddings) and `llm_tok/q` (reranker calls). Both are real API usage; indexing is reported once above, not per query.
+# 
+# The reranker's reply only counts as a ranking if it scores **every** candidate exactly once, with scores in 0–10. Partial replies, out-of-range scores and unparseable replies all fall back to the hybrid order and are counted by kind. A silently failing reranker would otherwise look like one that agrees with the retriever.
 
 # In[4]:
 
@@ -91,10 +94,11 @@ def print_table(rows, cols):
     for r in rows:
         print(" | ".join(str(r[c]).ljust(widths[c]) for c in cols))
 
-rows, per_query = re_.run_benchmark(documents, queries, retrievers, reranker, k=5)
+rows, per_query, rerank_status = re_.run_benchmark(documents, queries, retrievers, reranker, k=5)
 print_table(rows, ["method", "recall@5", "mrr", "ndcg@5", "p50_latency_ms", "p95_latency_ms",
-                   "tokens", "est_cost_usd", "parse_failures"])
-print(f"\n(est_cost_usd assumes ${re_.ASSUMED_USD_PER_1K_TOKENS}/1K tokens; token counts are real API usage)")
+                   "embed_tok/q", "llm_tok/q", "est_usd/1k_q"])
+print(f"\nreranker replies: {rerank_status}")
+print(f"(est_usd/1k_q = cost per 1,000 queries at an assumed ${re_.ASSUMED_USD_PER_1K_TOKENS}/1K tokens; token counts are real API usage)")
 
 
 # ## Lexical vs paraphrase queries
@@ -124,7 +128,7 @@ for row in per_query:
 
 # ## Faithfulness
 # 
-# Retrieval metrics say whether the right passage was found; they say nothing about whether the answer built from it sticks to it. For every query, the reranked top 3 passages are handed to the model to answer, then a judge call lists each claim in the answer and whether the context supports it.
+# Retrieval metrics say whether the right passage was found; they say nothing about whether the answer built from it sticks to it. For every query, the reranked top 3 passages are handed to the model to answer, then a judge call lists each claim in the answer and whether the context supports it. An answer counts as faithful only if every claim is supported: this is computed from the claim list, not taken from a summary flag the judge might contradict.
 # 
 # The same model generates and judges, so this is a self-consistency check rather than an independent audit. Live mode only: there is no offline stand-in for a generator.
 
@@ -144,7 +148,7 @@ else:
     claims = sum(f["claims"] for f in judged)
     supported = sum(f["supported_claims"] for f in judged)
     print(f"faithful answers: {sum(f['faithful'] for f in judged)}/{len(judged)} "
-          f"(judge output unparseable for {len(faith) - len(judged)})")
+          f"(no usable claims from the judge for {len(faith) - len(judged)})")
     print(f"supported claims: {supported}/{claims} ({supported / max(claims, 1):.1%})")
     print(f"tokens: {sum(f['tokens'] for f in faith)}")
     for f in faith:
@@ -158,8 +162,9 @@ else:
 # 
 # - **Dense beat hybrid.** Dense alone reached Recall@5 = 1.00 and MRR = 0.971. Fusing in BM25 *lowered* it to 0.914 / 0.887. Hybrid only helps when the sparse side adds hits the dense side misses. Here the embedder already finds everything, so BM25 mostly contributes distractors that share keywords with the query (q07, q21, q24 and q25 above). "Hybrid is always better" is a default to test, not a law.
 # - **BM25 collapses on paraphrases.** Recall@5 fell from 0.921 on lexical queries to 0.719 on paraphrases, and it scored 0 on queries like q24/q25/q27/q29 that share no vocabulary with the answer. That is the gap an evaluation set made only of keyword queries would hide.
-# - **The reranker buys precision at a steep price.** It recovered everything hybrid lost (Recall@5 1.00, MRR 0.981, the best on the board). But p50 latency went from about 225 ms to about 1.8 s, p95 to about 5.9 s, and it used about 600 tokens per query. Its top-rank gain over dense alone was +0.01 MRR. On this corpus, dense-only is the better cost/quality point. The reranker earns its place when the first-stage retriever is weaker or the corpus is larger.
-# - **Reranker output isn't always parseable.** 2 of 35 replies weren't usable JSON and fell back to hybrid order. Counting these matters: silently falling back would have made the reranker look like it agreed with the retriever.
-# - **Answers were mostly faithful, but not entirely.** 32/35 answers were judged faithful and 82/86 claims supported. All three flagged answers added plausible outside knowledge, such as "even at night", "struggles with synonyms", or a definition of recall that isn't in the context. Correct retrieval did not stop unsupported additions.
+# - **The reranker is the most precise and by far the most expensive.** It recovered everything hybrid lost and ranked perfectly (MRR = nDCG@5 = 1.00), but it adds about 599 LLM tokens per query on top of about 16 embedding tokens. That is roughly 38× dense-only's token cost per query. Its p50 latency is about 3.2 s against about 0.3 s for dense. The p95 (25.6 s) mostly reflects SDK retry backoff while the endpoint was returning 429/503s during this run, not model latency. Over dense alone, the reranker's gain is +0.029 MRR. On this corpus, dense-only is the better cost/quality point. The reranker earns its place when the first-stage retriever is weaker or the corpus is larger.
+# - **All reranker replies were complete.** With strict validation (every candidate scored exactly once, scores 0–10), all 35 replies were usable, so the reranker row isn't flattered by silent fallbacks to the hybrid order.
+# - **Answers were mostly faithful, but not entirely.** 32/34 judged answers were faithful and 88/92 claims supported; for one query the judge returned no usable claim list, and it's reported as unjudged rather than counted as faithful. Both flagged answers added plausible outside knowledge to correctly retrieved context ("even at night", "struggles with synonyms"). Correct retrieval did not stop unsupported additions.
+# - **Indexing is cheap and one-time.** Embedding all 30 passages took 1,207 tokens, paid once and not per query.
 # 
-# **Limits.** 30 passages and 35 queries is small: dense retrieval hits the Recall@5 ceiling, so MRR/nDCG carry the comparison. The judge is the same model as the generator. Latency is from one hosted endpoint at one time of day. Rerun before quoting the numbers elsewhere.
+# **Limits.** 30 passages and 35 queries is small: dense retrieval hits the Recall@5 ceiling, so MRR/nDCG carry the comparison. The judge is the same model as the generator. Dollar figures use an assumed $0.002/1K tokens (NIM's hosted trial is free), so compare ratios rather than absolute costs. Latency is from one hosted endpoint on one afternoon.

@@ -2,7 +2,7 @@
 
 A hands-on lab covering the retrieval, agent, and observability patterns behind production LLM systems — built to understand each piece end to end rather than treat it as a black box.
 
-Every notebook is self-contained and runnable. Outputs are committed so you can see what each one actually produced without running it yourself.
+Every notebook runs from the repo checkout, and outputs are committed so you can see what each one actually produced without running it yourself. Most are standalone. The two eval notebooks keep their logic in `src/ai_engineering/` (so it can be unit tested) and their labeled sets in `data/`.
 
 ```
 notebooks/
@@ -32,7 +32,7 @@ A retrieval pipeline is four independent decisions. These work through each one 
 | [`rag_pipeline_with_hybrid_search`](notebooks/retrieval/rag_pipeline_with_hybrid_search.ipynb) | BM25 and dense retrieval fused into a single ranked result set |
 | [`llm_based_reranking`](notebooks/retrieval/llm_based_reranking.ipynb) | Reranking the shortlist — trading latency for precision at the top |
 | [`full_rag_pipeline`](notebooks/retrieval/full_rag_pipeline.ipynb) | The whole path assembled: ingest, chunk, embed, retrieve, rerank, generate |
-| [`rag_evaluation_benchmark`](notebooks/retrieval/rag_evaluation_benchmark.ipynb) | The question the notebooks above don't answer: which pipeline is actually better, and at what cost? BM25, dense, hybrid/RRF, and hybrid+LLM-rerank on a labeled set with distractor passages and paraphrase queries — Recall@5, MRR, nDCG@5, p50/p95 latency, tokens, and answer faithfulness. See [Results](#results). |
+| [`rag_evaluation_benchmark`](notebooks/retrieval/rag_evaluation_benchmark.ipynb) | The question the notebooks above don't answer: which pipeline is actually better, and at what cost? BM25, dense, hybrid/RRF, and hybrid+LLM-rerank on a labeled set with distractor passages and paraphrase queries — Recall@5, MRR, nDCG@5, p50/p95 latency, query-time embedding and LLM tokens, and answer faithfulness. See [Results](#results). |
 
 ## Agents & Orchestration
 
@@ -45,7 +45,7 @@ Multi-step agents on LangGraph, using incident response and support triage as th
 | [`incident_response_agent`](notebooks/agents/incident_response_agent.ipynb) | A stateful agent that investigates, forms hypotheses, proposes remediation |
 | [`customer_support_router_langgraph`](notebooks/agents/customer_support_router_langgraph.ipynb) | Conditional graph routing across specialist branches |
 | [`escalation_agent_langgraph_with_langfuse_observability`](notebooks/agents/escalation_agent_langgraph_with_langfuse_observability.ipynb) | An escalation agent instrumented with Langfuse — traces, spans, per-step cost |
-| [`agent_observability_eval`](notebooks/agents/agent_observability_eval.ipynb) | Turns tracing into numbers you can regress on: per-node latency/tokens/retries and every tool call's arguments, an eval suite over a labeled incident set (severity/action accuracy, RCA groundedness), and one **intentionally broken run** — evidence tools silently queried the wrong service and the verifier still said `ok` — diagnosed from the trace. See [Results](#results). |
+| [`agent_observability_eval`](notebooks/agents/agent_observability_eval.ipynb) | Turns tracing into numbers you can regress on: model-node latency/tokens/validation retries and every tool call's arguments, and an eval suite over incidents whose correct action (rollback, page, restart, monitor, close) must be derived from per-incident tool evidence. Scored separately for severity, action, tool targeting, and RCA groundedness (figure check + claim-by-claim judge). Includes one **intentionally broken run**, where evidence tools silently queried the wrong service and the verifier still said `ok`, diagnosed from the trace and scored in Langfuse. See [Results](#results). |
 
 **On observability:** the escalation agent is the piece worth reading first. It traces every node in the graph, so you can see which step burned the latency and which one produced the wrong answer. Debugging a multi-step agent without that is guesswork. [`agent_observability_eval`](notebooks/agents/agent_observability_eval.ipynb) is what that tracing is *for*: a regression you can catch automatically instead of a trace you have to remember to go look at.
 
@@ -86,23 +86,29 @@ Live runs on NVIDIA NIM (`nemotron-3-super-120b-a12b`, `nemotron-3-embed-1b`); f
 
 **Retrieval** — [`rag_evaluation_benchmark`](notebooks/retrieval/rag_evaluation_benchmark.ipynb), 30 passages (8 of them distractors), 35 queries (16 paraphrases):
 
-| Pipeline | Recall@5 | MRR | nDCG@5 | p50 / p95 latency | Recall@5 on paraphrases |
-|---|---|---|---|---|---|
-| BM25 | 0.829 | 0.762 | 0.763 | 1 / 2 ms | 0.719 |
-| Dense | **1.000** | 0.971 | 0.973 | 234 / 366 ms | **1.000** |
-| Hybrid (RRF) | 0.914 | 0.887 | 0.877 | 225 / 352 ms | 0.906 |
-| Hybrid + LLM rerank | **1.000** | **0.981** | **0.983** | 1.8 / 5.9 s | **1.000** |
+| Pipeline | Recall@5 | MRR | nDCG@5 | p50 latency | Tokens / query (embed + LLM) | Recall@5 on paraphrases |
+|---|---|---|---|---|---|---|
+| BM25 | 0.829 | 0.762 | 0.763 | 1 ms | 0 | 0.719 |
+| Dense | **1.000** | 0.971 | 0.973 | 311 ms | 16 | **1.000** |
+| Hybrid (RRF) | 0.914 | 0.887 | 0.877 | 234 ms | 16 | 0.906 |
+| Hybrid + LLM rerank | **1.000** | **1.000** | **1.000** | 3.2 s | 16 + 599 | **1.000** |
 
 - Fusing BM25 into a strong embedder *hurt*: −0.086 Recall@5 against dense alone, because keyword-matching distractors took the top slots.
-- The LLM reranker recovered that loss and ranked best, but for +0.01 MRR over dense alone it cost 8× the p50 latency and about 600 tokens per query. On this corpus, dense-only is the better tradeoff.
-- 32/35 generated answers were judged faithful (82/86 claims supported). All three failures added outside knowledge to correctly retrieved context.
+- The LLM reranker ranked perfectly, but for +0.029 MRR over dense alone it cost about 38× the query-time tokens and about 10× the p50 latency. On this corpus, dense-only is the better tradeoff. All 35 reranker replies passed strict validation (every candidate scored once, scores 0–10).
+- 32/34 judged answers were faithful (88/92 claims supported). Faithfulness is computed from the judge's claim list, not its summary flag. Both failures added outside knowledge to correctly retrieved context.
 
-**Agent** — [`agent_observability_eval`](notebooks/agents/agent_observability_eval.ipynb), 7 labeled incidents:
+**Agent** — [`agent_observability_eval`](notebooks/agents/agent_observability_eval.ipynb), 8 incidents whose correct action must be derived from per-incident tool evidence against a runbook:
 
-- Severity 1.00, action 1.00, grounded 1.00 in the committed run. An earlier live run triaged the SEV1/SEV2-boundary incident as SEV1, so treat single-run accuracy on 7 incidents as a smoke test.
-- The broken run (evidence tools silently pointed at the wrong service, weakened verifier) finished with `verdict: ok` and a rollback headed for approval. The trace-based groundedness check flagged it; the graph didn't.
-- With Langfuse configured, each incident is one trace: the node tree, every Nemotron call as a generation with token counts, and the eval results as scores. The broken run shows up as the trace with `grounded = 0`.
-- Checking whether the RCA *names* the right service is not a usable grounding signal. Healthy drafts usually omit the name, and a broken run's draft copied it from the prompt anyway. Scoring from the tool-call arguments in the trace is what works.
+| Metric | Result |
+|---|---|
+| Action accuracy (rollback / page / restart / monitor / close) | 8/8 |
+| Severity accuracy | 7/8: the one SEV2 → SEV1 miss repeats across every live run |
+| Tool targeting (every evidence call queried the alert's service) | 6/6 investigated |
+| RCA groundedness (figure check + claim-by-claim judge) | 6/6, 44/44 claims |
+| Crashed runs / transient provider errors retried | 0 / 50 |
+
+- In the broken run (evidence tools silently pointed at the wrong service, weakened verifier), the model *wrote in its RCA* that the tools had returned the wrong service's data, and still recommended a rollback, which reached the approval gate. `tool_target_ok = 0` flagged it from the trace. Noticing a problem in prose isn't a control; a trace-level check like this belongs in front of the approval gate.
+- With Langfuse configured, each incident is one trace: the node tree, every Nemotron call as a generation with token counts, the RCA judge's calls under an `rca-judge` span, and the eval results as scores.
 
 ## Running these
 
@@ -115,7 +121,7 @@ cp .env.example .env    # then fill in NVIDIA_API_KEY
 jupyter lab
 ```
 
-Nemotron reasons out loud by default, so every chat call passes `extra_body=NO_THINK` (`chat_template_kwargs.enable_thinking=False`) to get direct answers. Without it, short-answer calls such as YES/NO judges or single-token logprobs come back as the start of the model's reasoning.
+Nemotron reasons out loud by default, so every chat call to NIM passes `chat_template_kwargs.enable_thinking=False` (`NO_THINK`) to get direct answers. Without it, short-answer calls such as YES/NO judges or single-token logprobs come back as the start of the model's reasoning.
 
 Notebooks, scripts, and the service load `.env` from the repo root automatically (via `python-dotenv`); variables already exported in your shell take precedence. No keys are committed, and `.env` is gitignored.
 
@@ -131,15 +137,24 @@ The eval notebooks (`rag_evaluation_benchmark`, `agent_observability_eval`) and
 `os.environ` directly:
 
 ```python
-from ai_engineering.config import NO_THINK, get_settings, make_chat_client
+from ai_engineering.config import get_settings, make_chat_client
 
 settings = get_settings()
 client = make_chat_client(settings)   # OpenAI-compatible client for the configured provider
-client.chat.completions.create(model=settings.resolved_model, extra_body=NO_THINK, ...)
+client.chat.completions.create(model=settings.resolved_model,
+                               extra_body=settings.adapter.chat_extra_body(), ...)
+client.embeddings.create(model=settings.resolved_embedding_model, input=texts,
+                         extra_body=settings.adapter.embedding_extra_body("query"))
 ```
 
-Switching from NVIDIA NIM to OpenAI, or pointing at a different model, is then a `.env`
-edit (`LLM_PROVIDER=openai`, `OPENAI_API_KEY=...`) rather than a code change. The older
+Provider differences beyond URL and model live in `ProviderAdapter`, not at call sites.
+NIM's `chat_template_kwargs` (the thinking switch) and its embeddings' `input_type`
+(query vs passage) are sent only when `LLM_PROVIDER=nvidia`: OpenAI has neither
+parameter and rejects unknown request arguments. Only OpenAI-compatible providers
+(`nvidia`, `openai`) are accepted; anything else fails at config load, not halfway
+through a run. Switching to OpenAI is a `.env` edit (`LLM_PROVIDER=openai`,
+`OPENAI_API_KEY=...`). The request shape per provider is unit tested, but the committed
+results are NIM runs only. The older
 notebooks and their `scripts/*.py` exports still read `NVIDIA_API_KEY` directly and are
 unaffected — this hasn't been backported across all of them, since that would mean
 re-running and re-committing outputs for every notebook, not just editing imports.
