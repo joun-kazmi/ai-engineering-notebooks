@@ -5,6 +5,7 @@
 
 
 import os
+import re
 from dotenv import load_dotenv
 load_dotenv()  # picks up .env from the repo root
 # Nemotron reasons out loud by default; these demos want direct answers
@@ -29,6 +30,7 @@ def llm_rerank(query, documents, top_k=3, verbose=True):
         prompt = f"""On a scale of 1 to 10, how relevant is the following document to the query?
 Query: {query}
 Document: {doc}
+Respond with only the number.
 Relevance score (1-10):"""
 
         response = client.chat.completions.create(
@@ -42,8 +44,10 @@ Relevance score (1-10):"""
         print('response ', response)
 
         raw_score = response.choices[0].message.content.strip()
+        # Models often wrap the number in prose ("a score of 9 out of 10"), so take the first number
+        match = re.search(r"\d+(?:\.\d+)?", raw_score)
         try:
-            score = float(raw_score)
+            score = float(match.group() if match else raw_score)
         except ValueError:
             # If the model doesn't return a number, assign 0 and optionally log
             print(f"Warning: Could not parse score for doc: '{doc[:50]}...' -> '{raw_score}'")

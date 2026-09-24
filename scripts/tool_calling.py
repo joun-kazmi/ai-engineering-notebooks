@@ -114,14 +114,23 @@ if tool_calls:
     
     for tool_call in tool_calls:
         function_name = tool_call.function.name
-        function_args = json.loads(tool_call.function.arguments)
+        try:
+            function_args = json.loads(tool_call.function.arguments)
+        except json.JSONDecodeError:
+            function_args = None  # malformed JSON from the model; reported back below
         
         print(f"Executing local function: {function_name}(**{function_args})")
         
         # Look up the actual function and invoke it dynamically
         function_to_call = available_tools.get(function_name)
         if function_to_call:
-            tool_output = function_to_call(**function_args)
+            try:
+                if function_args is None:
+                    raise TypeError(f"arguments are not valid JSON: {tool_call.function.arguments!r}")
+                tool_output = function_to_call(**function_args)
+            except TypeError as e:
+                # Malformed arguments (bad JSON or a wrong parameter name): report back so the model can recover
+                tool_output = json.dumps({"error": f"Invalid arguments for {function_name}: {e}"})
             
             # ---------------------------------------------------------------
             # 5. PASS TOOL RESULTS BACK TO THE LLM
