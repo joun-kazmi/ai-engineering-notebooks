@@ -10,11 +10,13 @@ or a way to catch a regression automatically. This module adds that layer:
 
   * Per-node spans (RunTrace): latency, model/provider, prompt/completion
     tokens, schema-validation retries, and per-tool-call arguments, success,
-    and a retrieval-relevance score. The LLM calls here go through the raw
-    OpenAI client, which Langfuse's LangChain callback does not see, so this
-    trace is the only place token counts and tool arguments are recorded.
-    When LANGFUSE_* is configured the callback is still attached, giving the
-    node-level tree in Langfuse as in the escalation-agent notebook.
+    and a retrieval-relevance score.
+  * Langfuse, when LANGFUSE_* is configured: each incident is one trace — a
+    root span holding the LangGraph node tree (LangChain callback), every
+    LLM call as a generation inside its node (Langfuse's OpenAI wrapper;
+    the raw client is invisible to the callback), the RunTrace summary as
+    metadata, and the eval results attached as scores, so a regression shows
+    up as a failing score on a specific trace in the Langfuse UI.
   * An eval harness over a labeled incident set (data/incident_eval_set.json):
     severity/action accuracy, RCA groundedness, retries, tool calls, latency.
   * One intentionally broken run: a tool-layer bug sends every evidence tool
@@ -103,6 +105,7 @@ class NodeSpan:
 class RunTrace:
     thread_id: str
     spans: list[NodeSpan] = field(default_factory=list)
+    langfuse_trace_id: str | None = None
 
     @property
     def total_latency_ms(self) -> float:
@@ -147,20 +150,37 @@ def traced(trace: RunTrace, node: str):
         trace.spans.append(span)
 
 
-def _langfuse_handler():
-    """Langfuse CallbackHandler if configured, else None — same pattern as
-    notebooks/agents/escalation_agent_langgraph_with_langfuse_observability."""
-    if not settings.langfuse_configured:
-        return None
-    from langfuse import Langfuse
-    from langfuse.langchain import CallbackHandler
+_langfuse = None
 
-    Langfuse(
-        public_key=settings.langfuse_public_key.get_secret_value(),
-        secret_key=settings.langfuse_secret_key.get_secret_value(),
-        host=settings.langfuse_base_url,
-    )
-    return CallbackHandler()
+
+def langfuse_client():
+    """The Langfuse client if LANGFUSE_* is configured, else None. Initialized
+    once with the keys from Settings (which reads .env itself, so they may not
+    be in os.environ for the SDK to find on its own)."""
+    global _langfuse
+    if _langfuse is None and settings.langfuse_configured:
+        from langfuse import Langfuse
+
+        _langfuse = Langfuse(
+            public_key=settings.langfuse_public_key.get_secret_value(),
+            secret_key=settings.langfuse_secret_key.get_secret_value(),
+            host=settings.langfuse_base_url,
+        )
+    return _langfuse
+
+
+def trace_summary(trace: "RunTrace") -> dict:
+    """RunTrace as plain JSON for Langfuse metadata."""
+    return {
+        "total_latency_ms": round(trace.total_latency_ms),
+        "total_tokens": trace.total_tokens,
+        "total_retries": trace.total_retries,
+        "nodes": [{"node": s.node, "latency_ms": round(s.latency_ms), "retries": s.retries,
+                   "tokens": s.prompt_tokens + s.completion_tokens,
+                   "tool_calls": [{"name": tc.name, "args": tc.args, "success": tc.success,
+                                   "retrieval_score": round(tc.retrieval_score, 2)} for tc in s.tool_calls]}
+                  for s in trace.spans],
+    }
 
 
 def _relevance(alert: str, text: str) -> float:
@@ -292,7 +312,15 @@ _client = None
 def _live_client():
     global _client
     if _client is None:
-        _client = make_chat_client(settings, max_retries=EVAL_MAX_RETRIES)
+        if langfuse_client():
+            # Drop-in wrapper: same OpenAI client, but each call is recorded as
+            # a Langfuse generation (model, tokens, latency) under the current span.
+            from langfuse.openai import OpenAI
+
+            _client = OpenAI(base_url=settings.resolved_base_url, api_key=settings.require_api_key(),
+                             max_retries=EVAL_MAX_RETRIES)
+        else:
+            _client = make_chat_client(settings, max_retries=EVAL_MAX_RETRIES)
     return _client
 
 
@@ -477,14 +505,32 @@ def run_once(alert: str, thread_id: str, broken: bool = False):
     trace = RunTrace(thread_id=thread_id)
     app = build_graph(trace, broken=broken)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 30}
-    handler = _langfuse_handler()
-    if handler:
-        config["callbacks"] = [handler]
 
-    state = app.invoke({"alert": alert, "attempts": 0, "evidence": []}, config)
-    if state.get("__interrupt__"):
-        # Paused at human_gate — auto-approve for reproducible evaluation runs.
-        state = app.invoke(Command(resume={"approved": True, "approver": "eval-harness"}), config)
+    def invoke():
+        state = app.invoke({"alert": alert, "attempts": 0, "evidence": []}, config)
+        if state.get("__interrupt__"):
+            # Paused at human_gate — auto-approve for reproducible evaluation runs.
+            state = app.invoke(Command(resume={"approved": True, "approver": "eval-harness"}), config)
+        return state
+
+    lf = langfuse_client()
+    if lf is None:
+        return invoke(), trace
+
+    from langfuse.langchain import CallbackHandler
+
+    config["callbacks"] = [CallbackHandler()]
+    # One root span per incident, so both invokes (before and after the
+    # human_gate interrupt) and every LLM generation land in a single trace.
+    with lf.start_as_current_observation(name=f"incident:{thread_id}", as_type="span") as root:
+        state = invoke()
+        trace.langfuse_trace_id = lf.get_current_trace_id()
+        root.update(
+            input={"alert": alert},
+            output={"outcome": state.get("outcome"), "report": state.get("report")},
+            metadata={"broken": broken, "mode": "offline" if OFFLINE else "live",
+                      "model": settings.resolved_model, "run_trace": trace_summary(trace)},
+        )
     return state, trace
 
 
@@ -554,11 +600,30 @@ def evaluate_run(incident: dict, state: dict, trace: RunTrace) -> EvalResult:
     )
 
 
+def score_in_langfuse(result: EvalResult, trace: RunTrace) -> None:
+    """Attach eval results to the run's Langfuse trace as scores. No-op
+    without Langfuse. Call flush_langfuse() before the process exits."""
+    lf = langfuse_client()
+    if lf is None or trace.langfuse_trace_id is None:
+        return
+    for name, value in [("severity_correct", result.severity_correct), ("action_correct", result.action_correct),
+                        ("grounded", result.grounded), ("tools_on_target", result.tools_on_target)]:
+        lf.create_score(trace_id=trace.langfuse_trace_id, name=name, value=float(value), data_type="BOOLEAN")
+    lf.create_score(trace_id=trace.langfuse_trace_id, name="eval_score", value=result.score, data_type="NUMERIC")
+
+
+def flush_langfuse() -> None:
+    if langfuse_client():
+        langfuse_client().flush()
+
+
 def run_eval_suite(dataset: list[dict], broken: bool = False) -> list[EvalResult]:
     results = []
     for incident in dataset:
         state, trace = run_once(incident["alert"], thread_id=f"eval-{incident['id']}", broken=broken)
-        results.append(evaluate_run(incident, state, trace))
+        result = evaluate_run(incident, state, trace)
+        score_in_langfuse(result, trace)
+        results.append(result)
     return results
 
 

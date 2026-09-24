@@ -101,6 +101,7 @@ Live runs on NVIDIA NIM (`nemotron-3-super-120b-a12b`, `nemotron-3-embed-1b`); f
 
 - Severity 1.00, action 1.00, grounded 1.00 in the committed run. An earlier live run triaged the SEV1/SEV2-boundary incident as SEV1, so treat single-run accuracy on 7 incidents as a smoke test.
 - The broken run (evidence tools silently pointed at the wrong service, weakened verifier) finished with `verdict: ok` and a rollback headed for approval. The trace-based groundedness check flagged it; the graph didn't.
+- With Langfuse configured, each incident is one trace: the node tree, every Nemotron call as a generation with token counts, and the eval results as scores. The broken run shows up as the trace with `grounded = 0`.
 - Checking whether the RCA *names* the right service is not a usable grounding signal. Healthy drafts usually omit the name, and a broken run's draft copied it from the prompt anyway. Scoring from the tool-call arguments in the trace is what works.
 
 ## Running these

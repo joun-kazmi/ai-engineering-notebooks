@@ -46,6 +46,7 @@ print("Langfuse:", "configured, node spans forwarded" if ae.settings.langfuse_co
 
 incidents = ae.load_incidents()
 state, trace = ae.run_once(incidents[0]["alert"], thread_id="narrated-healthy")
+ae.score_in_langfuse(ae.evaluate_run(incidents[0], state, trace), trace)
 print("alert:  ", incidents[0]["alert"])
 print("triage: ", state["parsed"])
 print("verdict:", state["verdict"], "| outcome:", state["outcome"])
@@ -90,6 +91,7 @@ for r, inc in zip(results, incidents):
 
 broken_state, broken_trace = ae.run_once(incidents[0]["alert"], thread_id="narrated-broken", broken=True)
 broken_eval = ae.evaluate_run(incidents[0], broken_state, broken_trace)
+ae.score_in_langfuse(broken_eval, broken_trace)
 print("verdict inside the graph:", broken_state["verdict"])
 print("outcome:", broken_state["outcome"])
 print("root cause written:", broken_state["report"]["root_cause"])
@@ -122,13 +124,30 @@ print(f"broken run queried:  {evidence_targets(broken_trace)}   mean retrieval_s
 print(f"verify said: healthy={state['verdict']}, broken={broken_state['verdict']}")
 
 
+# ## In Langfuse
+# 
+# With `LANGFUSE_*` set, every run above is also one Langfuse trace: a root `incident:<thread_id>` span holding the LangGraph node tree, each Nemotron call as a generation (model, tokens, latency) inside the node that made it, the `RunTrace` summary with tool-call arguments as metadata, and the eval results as scores (`severity_correct`, `action_correct`, `grounded`, `tools_on_target`, `eval_score`). The broken run is the trace with `grounded = 0` even though its `verify` node said `ok`. Filtering on that score is how you'd find it in production traffic.
+
+# In[6]:
+
+
+lf = ae.langfuse_client()
+if lf is None:
+    print("Langfuse not configured; set LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY to send traces and scores.")
+else:
+    ae.flush_langfuse()
+    print(f"sent {len(results) + 2} traces with scores to Langfuse")
+    for label, t in (("healthy", trace), ("broken", broken_trace)):
+        print(f"  {label:8s} {lf.get_trace_url(trace_id=t.langfuse_trace_id)}")
+
+
 # ## Findings
 # 
 # From the live run above (`nemotron-3-super-120b-a12b` doing triage, tool calling, verification and RCA writing):
 # 
-# - **The graph's own verdict can't be trusted as a quality signal.** In the broken run `verify` said `ok`, the RCA was written, and the approval gate would have been asked to approve a rollback, all on evidence about the wrong service. The run finished without an error. It showed up only in the trace: every tool call's `service` argument was `unrelated-service`, and mean retrieval relevance halved (0.29 → 0.14).
-# - **Check what the agent *did*, not what it *wrote*.** The first version of this harness scored groundedness by whether the RCA draft named the alert's service. It was wrong both ways. In 3 of the 4 incidents above that were investigated, the draft never names the service (`names_svc = False`) even though every tool call was on target. In an earlier live run of the broken case, the draft *did* name `payments-api`: the model copied it from its task prompt although no tool had returned anything about it. Scoring from the trace's tool arguments has neither problem.
-# - **Healthy-suite scores:** severity 1.00, action 1.00, grounded 1.00 over 7 incidents, about 4.2K tokens and about 13.7 s per incident, and no schema-validation retries. A single run on 7 incidents is a smoke test, not a benchmark. In the earlier live run, inc04 (connection pool exhausted, error rate climbing) was triaged SEV1 instead of SEV2, and inc01's action came out `page_oncall` in one narrated run and `rollback_deploy` in another. Severity at the SEV1/SEV2 boundary is where this agent is unstable, so it's the first place to spend repeated trials.
-# - **Investigation dominates cost.** In both traced runs the tool-calling loop is the largest node: about 60–80% of tokens and 45–60% of latency. The SEV1/SEV2 incidents it runs on cost 4–10K tokens against about 300 for an incident auto-closed at triage. It is the node to budget and cap (tool-call limits, per-tool timeouts) first.
+# - **The graph's own verdict can't be trusted as a quality signal.** In the broken run `verify` said `ok`, the RCA was written, and the approval gate would have been asked to approve a rollback, all on evidence about the wrong service. The run finished without an error. It showed up only in the trace: every tool call's `service` argument was `unrelated-service`, and mean retrieval relevance fell from 0.31 to 0.12.
+# - **Check what the agent *did*, not what it *wrote*.** The first version of this harness scored groundedness by whether the RCA draft named the alert's service. It was wrong both ways. In 2 of the 4 investigated incidents above, the draft never names the service (`names_svc = False`) even though every tool call was on target. And the broken run's RCA opens with "The payments-api service has an error rate of 31%…" although every tool it called returned data about `unrelated-service`. The model took the name from its task prompt and the numbers from the wrong service's metrics. Scoring from the trace's tool arguments has neither problem.
+# - **Healthy-suite scores:** severity 1.00, action 1.00, grounded 1.00 over 7 incidents, about 4.8K tokens and about 14 s per incident, and no schema-validation retries. A single run on 7 incidents is a smoke test, not a benchmark. In the earlier live run, inc04 (connection pool exhausted, error rate climbing) was triaged SEV1 instead of SEV2, and inc01's action came out `page_oncall` in one narrated run and `rollback_deploy` in another. Severity at the SEV1/SEV2 boundary is where this agent is unstable, so it's the first place to spend repeated trials.
+# - **Investigation dominates cost.** In both traced runs the tool-calling loop is the largest node: about 70–80% of tokens and 45–90% of latency. The SEV1/SEV2 incidents it runs on cost 6–11K tokens against about 300 for an incident auto-closed at triage. It is the node to budget and cap (tool-call limits, per-tool timeouts) first.
 # 
-# **Next:** run each incident k times and report pass rates rather than single outcomes, grow the incident set past the SEV1/SEV2 boundary, and send `RunTrace` scores to Langfuse as trace scores so regressions show up on the dashboard. Today only the LangGraph node tree reaches Langfuse, because the raw OpenAI client calls aren't instrumented.
+# **Next:** run each incident k times and report pass rates rather than single outcomes, and grow the incident set past the SEV1/SEV2 boundary.
