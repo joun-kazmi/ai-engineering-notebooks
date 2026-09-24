@@ -1,33 +1,27 @@
 import json
 import operator
-import os
 import re
+import sys
 import uuid
+from pathlib import Path
 from typing import Annotated, Literal, TypedDict
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ValidationError
-from openai import OpenAI
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-load_dotenv()  # picks up .env from the repo root
-# Nemotron reasons out loud by default; these demos want direct answers
-NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ai_engineering.config import NO_THINK, get_settings, make_chat_client
 
 # ══════════════════════════════════════════════════════════
 # 1. MODEL SETUP
 # ══════════════════════════════════════════════════════════
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY") # Replace with your key or use env
-
-llm_client = OpenAI(
-    base_url="https://integrate.api.nvidia.com/v1",
-    api_key=NVIDIA_API_KEY,
-)
-RAW_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+_settings = get_settings()
+llm_client = make_chat_client(_settings)
+RAW_MODEL = _settings.resolved_model
 
 # ══════════════════════════════════════════════════════════
 # 2. RELIABILITY HELPER (Schema-injected)
