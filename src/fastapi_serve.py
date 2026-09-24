@@ -174,7 +174,7 @@ def route_rca(s): return "human_gate" if s["report"]["next_action"] in WRITE_ACT
 def route_gate(s): return "execute" if s["outcome"] == "approved" else "escalate_human"
 
 # ══════════════════════════════════════════════════════════
-# 6. COMPILE THE LANGGRAPH APP (This fixes your error!)
+# 6. COMPILE THE LANGGRAPH APP
 # ══════════════════════════════════════════════════════════
 b = StateGraph(EscalationState)
 for name, fn in [("triage", triage), ("investigate", investigate), ("verify", verify),
@@ -192,7 +192,6 @@ b.add_edge("execute", END)
 b.add_edge("escalate_human", END)
 b.add_edge("auto_close", END)
 
-# THIS IS THE MISSING PIECE! We define 'app' right here.
 app = b.compile(checkpointer=InMemorySaver())
 
 # ══════════════════════════════════════════════════════════
