@@ -123,7 +123,11 @@ if tool_calls:
         
         # Look up the actual function and invoke it dynamically
         function_to_call = available_tools.get(function_name)
-        if function_to_call:
+        if function_to_call is None:
+            # Hallucinated tool name: still answer the call, or the next request would
+            # contain a tool_call with no matching tool result
+            tool_output = json.dumps({"error": f"Unknown tool: {function_name}"})
+        else:
             try:
                 if function_args is None:
                     raise TypeError(f"arguments are not valid JSON: {tool_call.function.arguments!r}")
@@ -132,16 +136,16 @@ if tool_calls:
                 # Malformed arguments (bad JSON or a wrong parameter name): report back so the model can recover
                 tool_output = json.dumps({"error": f"Invalid arguments for {function_name}: {e}"})
             
-            # ---------------------------------------------------------------
-            # 5. PASS TOOL RESULTS BACK TO THE LLM
-            # ---------------------------------------------------------------
-            messages.append({
-                "tool_call_id": tool_call.id,  # Matches result to the exact request
-                "role": "tool",
-                "name": function_name,
-                "content": tool_output  # Function output MUST be a string
-            })
-            print(f"Tool Result returned: {tool_output}")
+        # ---------------------------------------------------------------
+        # 5. PASS TOOL RESULTS BACK TO THE LLM
+        # ---------------------------------------------------------------
+        messages.append({
+            "tool_call_id": tool_call.id,  # Matches result to the exact request
+            "role": "tool",
+            "name": function_name,
+            "content": tool_output  # Function output MUST be a string
+        })
+        print(f"Tool Result returned: {tool_output}")
 
     # -----------------------------------------------------------------------
     # 6. FINAL LLM CALL FOR SYNTHESIS
