@@ -98,12 +98,19 @@ class Settings(BaseSettings):
     # backoff can't ride out.
     llm_max_rpm: int | None = None
 
+    # Optional USD prices per million prompt / completion tokens, for run cost
+    # budgets (ai_engineering.tool_runtime.RunBudget). Unset = cost is reported
+    # as "unpriced" and not capped; NIM's free tier has no price to put here.
+    llm_usd_per_mtok_in: float | None = None
+    llm_usd_per_mtok_out: float | None = None
+
     langfuse_public_key: SecretStr | None = None
     langfuse_secret_key: SecretStr | None = None
     langfuse_base_url: str = "https://cloud.langfuse.com"
 
     @field_validator(
         "llm_base_url", "llm_model", "embedding_model", "llm_max_rpm",
+        "llm_usd_per_mtok_in", "llm_usd_per_mtok_out",
         "nvidia_api_key", "openai_api_key",
         "langfuse_public_key", "langfuse_secret_key",
         mode="before",

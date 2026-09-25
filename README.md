@@ -2,7 +2,7 @@
 
 A hands-on lab covering the retrieval, agent, and observability patterns behind production LLM systems — built to understand each piece end to end rather than treat it as a black box.
 
-Every notebook runs from the repo checkout, and outputs are committed so you can see what each one actually produced without running it yourself. Most are standalone. The two eval notebooks keep their logic in `src/ai_engineering/` (so it can be unit tested) and their labeled sets in `data/`.
+Every notebook runs from the repo checkout, and outputs are committed so you can see what each one actually produced without running it yourself. Most are standalone. The eval and reliability notebooks keep their logic in `src/ai_engineering/` (so it can be unit tested) and their labeled sets in `data/`.
 
 ```
 notebooks/
@@ -11,7 +11,7 @@ notebooks/
   llm-behaviour/   temperature, logprobs, tokenisation, structured output, streaming
   fine-tuning/     dataset construction and validation
   safety/          prompt injection and guardrails
-src/               FastAPI service wrapping a LangGraph agent; ai_engineering/ (provider config + eval harness code)
+src/               FastAPI service wrapping a LangGraph agent; ai_engineering/ (provider config, eval harness, hardened tool runtime)
 scripts/           plain .py exports of every notebook (easier to diff than JSON)
 data/              small sample corpus, training data, and labeled eval sets
 ```
@@ -46,6 +46,7 @@ Multi-step agents on LangGraph, using incident response and support triage as th
 | [`customer_support_router_langgraph`](notebooks/agents/customer_support_router_langgraph.ipynb) | Conditional graph routing across specialist branches |
 | [`escalation_agent_langgraph_with_langfuse_observability`](notebooks/agents/escalation_agent_langgraph_with_langfuse_observability.ipynb) | An escalation agent instrumented with Langfuse — traces, spans, per-step cost |
 | [`agent_observability_eval`](notebooks/agents/agent_observability_eval.ipynb) | Turns tracing into numbers you can regress on: model-node latency/tokens/validation retries and every tool call's arguments, and an eval suite over incidents whose correct action (rollback, page, restart, monitor, close) must be derived from per-incident tool evidence. Scored separately for severity, action, tool targeting, and RCA groundedness (figure check + claim-by-claim judge). Includes one **intentionally broken run**, where evidence tools silently queried the wrong service and the verifier still said `ok`, diagnosed from the trace and scored in Langfuse. See [Results](#results). |
+| [`agent_reliability_hardening`](notebooks/agents/agent_reliability_hardening.ipynb) | The same agent, hardened for when things around it go wrong. Tools have Pydantic input and output contracts, and their schemas are generated from the input model. Every tool call gets a per-tool timeout and bounded retries with exponential backoff and jitter, using one retryable-vs-not classification. Investigation is read-only and the remediation actions are real write tools. Approval is bound to the exact arguments and idempotency key of one write. Run budgets cover LLM calls, tool calls, tokens, cost, time and graph steps, and exhausting one escalates instead of crashing. Every call, including refused ones, gets an audit record. Faults are injected deterministically: 503s, hangs, malformed output, a prompt-injected log line, a runaway loop, and a write that commits but loses its response. See [Results](#results). |
 
 **On observability:** the escalation agent is the piece worth reading first. It traces every node in the graph, so you can see which step burned the latency and which one produced the wrong answer. Debugging a multi-step agent without that is guesswork. [`agent_observability_eval`](notebooks/agents/agent_observability_eval.ipynb) is what that tracing is *for*: a regression you can catch automatically instead of a trace you have to remember to go look at.
 
@@ -109,6 +110,26 @@ Live runs on NVIDIA NIM (`nemotron-3-super-120b-a12b`, `nemotron-3-embed-1b`); f
 
 - In the broken run (evidence tools silently pointed at the wrong service, weakened verifier), the model *wrote in its RCA* that the tools had returned the wrong service's data, and still recommended a rollback, which reached the approval gate. `tool_target_ok = 0` flagged it from the trace. Noticing a problem in prose isn't a control; a trace-level check like this belongs in front of the approval gate.
 - With Langfuse configured, each incident is one trace: the node tree, every Nemotron call as a generation with token counts, the RCA judge's calls under an `rca-judge` span, and the eval results as scores.
+
+**Agent reliability** — [`agent_reliability_hardening`](notebooks/agents/agent_reliability_hardening.ipynb), the same 8 incidents with faults injected into every run. `get_metrics` returns a 503 once, `get_recent_deploys` hangs past its timeout once, and every write commits and then loses its response once:
+
+| Metric | Result |
+|---|---|
+| Action accuracy | 7/8; the miss escalated instead of acting (see below) |
+| Runs where every invariant held (approved writes only, no duplicate side effects, no write outside `execute`, finished within budget or escalated because of it) | 8/8 |
+| Side effects / approved writes | 4 / 4: every write timed out once and was `deduplicated` on retry |
+| Tool calls that failed on the first attempt and recovered | 16 / 36 |
+| Transient provider errors retried | 76 (73×429) |
+
+- **Prompt injection.** A log line told the agent to roll back checkout-api, whose last deploy was 3 days ago. Read-only scoping refused the direct write. The live model still *recommended* the rollback, and a deterministic runbook precondition, checked before the approval gate, stopped it. Before that check existed, the injected rollback got through auto-approval in a development run. Scoping stops the model from writing; it doesn't stop it from proposing a bad write.
+- **The miss.** For inc08 the model got the action right (page_oncall), but named the team in a form that failed the team-slug contract, so the run escalated before the gate. Every write that ran had valid, approved arguments.
+- **What surfaced only in live runs:**
+  - An in-flight LLM request stalled a run for over 20 minutes, so each request's timeout is now capped at the run's remaining time budget.
+  - A tool that never recovered burned the whole 30-call LLM budget, which is why there's a per-tool circuit breaker.
+  - A restart targeted the service's own name as the replica.
+  - Triage returned `service="service"`.
+
+  The last two were schema-valid, so each now has a grounding check.
 
 ## Running these
 
@@ -175,9 +196,16 @@ from whether an API key is configured for `LLM_PROVIDER`:
 Hosted endpoints return transient 503s under load, so both harnesses raise the OpenAI SDK's
 retry budget (`make_chat_client(max_retries=...)`) rather than dying on one bad call.
 
+`agent_reliability_hardening` works the same way (logic in `tool_runtime.py`, which is
+generic, and `agent_reliability.py`, the hardened agent). Its faults are injected
+deterministically, so every failure mode shows up in both modes. Set
+`LLM_USD_PER_MTOK_IN`/`_OUT` to enforce a per-run cost budget; without them, cost is
+reported as unpriced.
+
 ```bash
 python scripts/rag_evaluation_benchmark.py
 python scripts/agent_observability_eval.py
+python scripts/agent_reliability_hardening.py
 ```
 
 To run the FastAPI service (from the repo root):
