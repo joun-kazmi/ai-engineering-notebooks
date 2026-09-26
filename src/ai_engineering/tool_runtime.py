@@ -309,9 +309,17 @@ def decide(proposal: ProposedCall, approver: str, approved: bool) -> Approval:
 
 @dataclass(frozen=True)
 class BudgetLimits:
-    """Per-run caps. `None` disables a cap. Limits are checked *before* the
-    next unit of work, against what's already been spent, so a run can
-    overshoot `max_tokens` by at most one LLM call's usage."""
+    """Per-run limits. `None` disables one. All are checked *before* the next
+    unit of work, against what's already been spent, but they bound usage
+    differently:
+
+    * hard caps — LLM calls, tool calls, graph steps, elapsed time: final
+      usage never exceeds them (time within a small scheduling grace, since
+      each LLM attempt's deadline is the time left);
+    * soft limits — tokens, cost: only known after a call returns, so the
+      call that crosses the threshold completes and all further work is
+      stopped. Final usage can exceed them by one call's usage; see
+      RunBudget.soft_overshoot()."""
     max_llm_calls: int | None = 40
     max_tool_calls: int | None = 40
     max_tokens: int | None = 80_000
@@ -322,8 +330,9 @@ class BudgetLimits:
 
 class RunBudget:
     """Counts what a run has spent and raises BudgetExceeded when the next
-    unit of work would go past a limit. Cost is only computed (and only
-    capped) when per-million-token prices are given."""
+    unit of work would go past a limit (see BudgetLimits for which limits
+    are hard caps and which are soft). Cost is only computed (and only
+    limited) when per-million-token prices are given."""
 
     def __init__(self, limits: BudgetLimits = BudgetLimits(), usd_per_mtok_in: float | None = None,
                  usd_per_mtok_out: float | None = None, clock: Callable[[], float] = time.monotonic):
@@ -421,6 +430,18 @@ class RunBudget:
             over.append("time_s")
         return over
 
+    def soft_overshoot(self) -> dict[str, float]:
+        """How far final usage went past the soft limits (tokens, cost), by
+        design at most one call's usage. Empty when within them. Reported,
+        not treated as a violation."""
+        over = {}
+        if self.limits.max_tokens is not None and self.tokens > self.limits.max_tokens:
+            over["tokens"] = self.tokens - self.limits.max_tokens
+        cost = self.cost_usd
+        if cost is not None and self.limits.max_cost_usd is not None and cost > self.limits.max_cost_usd:
+            over["cost_usd"] = round(cost - self.limits.max_cost_usd, 6)
+        return over
+
     def snapshot(self) -> dict:
         lim = self.limits
         cost = self.cost_usd
@@ -432,6 +453,7 @@ class RunBudget:
             "elapsed_s": f"{self.elapsed_s:.1f}/{lim.max_seconds}",
             "graph_steps": f"{self.graph_steps}/{lim.max_graph_steps}",
             "exceeded": self.exceeded,
+            "soft_overshoot": self.soft_overshoot() or None,
         }
 
 

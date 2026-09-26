@@ -317,7 +317,7 @@ class FakeChat:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
 
 
-def test_llm_call_and_token_budgets():
+def test_token_budget_is_soft_the_crossing_call_completes_then_work_stops():
     budget = RunBudget(BudgetLimits(max_llm_calls=10, max_tokens=250))
     client = BudgetedChatClient(FakeChat(100, 50), budget)
     client.chat.completions.create(model="m")
@@ -624,10 +624,10 @@ def test_runbook_is_required_evidence():
 
 def test_invariant_checks_elapsed_time_directly():
     r = run("inc01")
-    assert ar.check_invariants(r)["within_budget"]
+    assert ar.check_invariants(r)["within_hard_budget"]
     r.budget.started -= 10_000  # as if an in-flight call ran far past max_seconds unnoticed
     assert r.budget.exceeded is None and r.budget.overruns() == ["time_s"]
-    assert not ar.check_invariants(r)["within_budget"]
+    assert not ar.check_invariants(r)["within_hard_budget"]
 
 
 # ---- per-tool retry classification
@@ -762,3 +762,88 @@ def test_filtered_log_search_does_not_hide_earlier_evidence(monkeypatch):
     r = run("inc05")
     assert len(searches) == 2
     assert r.action == "restart_service" and "restarted worker-3" in r.outcome, r.state.get("halted")
+
+
+# ---- the approval invariant checks binding independently of the executor
+
+def approved_run():
+    r = run("inc01")
+    assert r.action == "rollback_deploy" and ar.check_invariants(r)["writes_approved"]
+    return r, r.audit.where(tool="rollback_deploy")[0]
+
+
+@pytest.mark.parametrize("tamper", [
+    lambda rec, st: rec.args.update(from_version="v2.14.2"),             # ran other args than were shown
+    lambda rec, st: rec.approval.update(args_hash="0" * 16),             # approval for other args
+    lambda rec, st: rec.approval.update(idempotency_key="k" * 32),       # approval for another key
+    lambda rec, st: rec.approval.update(tool="page_oncall"),             # approval for another tool
+    lambda rec, st: rec.approval.update(approval_id="forged"),           # not the decision made at the gate
+    lambda rec, st: st["proposal"].update(args={"service": "payments-api", "from_version": "v9.9.9"}),
+    lambda rec, st: rec.approval.update(approved=False),
+], ids=["args", "args_hash", "key", "tool", "approval_id", "proposal", "rejected"])
+def test_approval_invariant_catches_every_binding_mismatch(tamper):
+    r, rec = approved_run()
+    tamper(rec, r.state)
+    assert not ar.check_invariants(r)["writes_approved"]
+
+
+def test_approval_invariant_catches_an_executor_regression(monkeypatch):
+    """If _check_approval() stopped checking the binding, the run would still
+    execute — and the invariant, which doesn't rely on it, must say so."""
+    real_decide = ar.decide
+    monkeypatch.setattr(ar, "decide", lambda p, approver, ok: replace(real_decide(p, approver, ok), args_hash="0" * 16))
+    denied = run("inc01")
+    assert not denied.infra.effects and "does not cover" in denied.state["halted"]  # the executor refuses it...
+
+    monkeypatch.setattr(ToolExecutor, "_check_approval", lambda *a: None)  # ...until it regresses
+    r = run("inc01")
+    assert r.infra.effects and not ar.check_invariants(r)["writes_approved"]
+
+
+# ---- hard vs soft budget limits
+
+def test_soft_overshoot_is_reported_not_hidden():
+    budget = RunBudget(BudgetLimits(max_tokens=10_000))
+    client = BudgetedChatClient(FakeChat(2_000, 1_000), budget)  # 3,000 tokens per call
+    for _ in range(3):
+        client.chat.completions.create(model="m")
+    assert budget.tokens == 9_000 and budget.soft_overshoot() == {}
+    client.chat.completions.create(model="m")  # 9,000 < 10,000 lets it start; it ends at 12,000
+    assert budget.soft_overshoot() == {"tokens": 2_000} and budget.snapshot()["soft_overshoot"] == {"tokens": 2_000}
+    with pytest.raises(BudgetExceeded, match="tokens"):
+        client.chat.completions.create(model="m")  # no further work
+    assert budget.llm_calls == 4 and budget.overruns() == []  # soft, so not a hard-cap violation
+
+
+def test_cost_budget_is_soft_too():
+    budget = RunBudget(BudgetLimits(max_cost_usd=0.001), usd_per_mtok_in=0.1, usd_per_mtok_out=0.4)
+    client = BudgetedChatClient(FakeChat(1_000, 2_000), budget)  # $0.0009 per call
+    client.chat.completions.create(model="m")
+    client.chat.completions.create(model="m")  # 0.0009 < 0.001: allowed, ends at 0.0018
+    assert budget.soft_overshoot()["cost_usd"] == pytest.approx(0.0008)
+    with pytest.raises(BudgetExceeded, match="cost_usd"):
+        client.chat.completions.create(model="m")
+
+
+# ---- SEV3 triage close must be confirmed by the metrics
+
+@pytest.mark.parametrize("inc_id", ["inc03", "inc07"])
+def test_sev3_close_is_confirmed_by_healthy_metrics(inc_id):
+    r = run(inc_id)
+    assert r.action == "close" and "metrics confirm no impact" in r.outcome
+    assert [x.tool for x in r.audit.records] == ["get_metrics"] and r.audit.records[0].node == "confirm_close"
+    assert_invariants(r)
+
+
+def test_misclassified_sev3_is_investigated_when_metrics_show_impact(monkeypatch):
+    monkeypatch.setattr(ae, "_classify_severity", lambda text: "SEV3")  # triage gets inc01 wrong
+    r = run("inc01")
+    assert "metrics disagree" not in (r.state.get("halted") or "")
+    assert r.state["close_rejected"].startswith("metrics show impact: error rate 31.0%")
+    assert r.action == "rollback_deploy" and r.infra.effects
+    assert_invariants(r)
+
+
+def test_sev3_close_without_metrics_escalates():
+    r = run("inc03", faults={"get_metrics": ar.Fault(transient_failures=99)})
+    assert r.action == "escalated" and "can't confirm a SEV3 close without metrics" in r.state["halted"]

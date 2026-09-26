@@ -31,6 +31,8 @@ What changes relative to agent_eval's graph:
     attempt is a charged LLM call bounded by the time left.
   * An investigation the verifier still rejects after MAX_INVESTIGATIONS
     passes escalates; it doesn't become an RCA because the retries ran out.
+  * A SEV3 triage close is confirmed by one metrics read (`confirm_close`);
+    if the metrics show impact, the incident is investigated instead.
   * `Scenario` injects faults deterministically: transient 503s, slow
     calls, malformed tool output, a prompt-injected log line, a runaway
     investigator, and writes that commit but lose their response.
@@ -54,7 +56,7 @@ from ai_engineering import agent_eval as ae
 from ai_engineering.config import make_chat_client
 from ai_engineering.tool_runtime import (
     Approval, AuditLog, BudgetedChatClient, BudgetExceeded, BudgetLimits, InvalidToolInput, Permission,
-    ProposedCall, RetryPolicy, RunBudget, ToolExecutor, ToolRegistry, ToolSpec, decide, propose,
+    ProposedCall, RetryPolicy, RunBudget, ToolExecutor, ToolRegistry, ToolSpec, args_hash, decide, propose,
 )
 
 OFFLINE = ae.OFFLINE
@@ -376,6 +378,7 @@ class HardenedState(TypedDict, total=False):
     proposal: dict
     approval: dict
     halted: str      # why the run stopped early (budget, contract, failed write); routes to escalate_human
+    close_rejected: str  # why a SEV3 triage close was overruled by the metrics; routes to investigate
     outcome: str
 
 
@@ -404,8 +407,9 @@ def action_precondition(action: str, args: dict, observations: dict) -> str | No
     (rule 4), so it must also show that rules 1-3 don't apply — rule 4's own
     condition alone would pass a stuck replica with a healthy error rate."""
     metrics = observations["get_metrics"]
-    deploys = observations["get_recent_deploys"]["deploys"]
-    unhealthy = [d for d in observations["get_dependencies"]["dependencies"] if d["status"] != "healthy"]
+    deploys = observations.get("get_recent_deploys", {}).get("deploys", [])
+    unhealthy = [d for d in observations.get("get_dependencies", {}).get("dependencies", [])
+                 if d["status"] != "healthy"]
     healthy, _, total = metrics["replicas_healthy"].partition("/")
     error_rate = metrics["error_rate"]
 
@@ -435,6 +439,12 @@ def action_precondition(action: str, args: dict, observations: dict) -> str | No
         stuck = _stuck_replicas(observations["search_logs"]["matches"])
         if args["replica"] not in stuck:
             return f"{args['replica']!r} isn't a replica the logs show as stuck (stuck: {stuck or 'none'})"
+    elif action == "close":
+        # A SEV3 triage close ("no customer impact yet") has to be borne out by
+        # the metrics: errors, latency and replicas all healthy.
+        if error_rate >= 0.05 or metrics["p95_latency_ms"] > metrics["slo_p95_ms"] or int(healthy) < int(total):
+            return (f"metrics show impact: error rate {error_rate:.1%}, p95 {metrics['p95_latency_ms']:g}ms vs SLO "
+                    f"{metrics['slo_p95_ms']:g}ms, {healthy}/{total} replicas healthy")
     elif action == "monitor":
         if error_rate > 0.10 and any(d["minutes_ago"] <= 30 for d in deploys):
             return f"rule 1 applies: error rate {error_rate:.1%} within 30 minutes of a deploy"
@@ -599,6 +609,8 @@ def build_graph(incident: dict, scenario: Scenario, budget: RunBudget, executor:
             # it; the refusal is what a real model would get back.
             reads.call("rollback_deploy", {"service": service, "from_version": version}, node="investigate")
         task = f"Investigate {service}: {state['alert']}"
+        if state.get("close_rejected"):
+            task += f"\nTriage rated this SEV3 (no impact), but the metrics disagree: {state['close_rejected']}."
         if state.get("verdict") == "revise":
             task += f"\nYour previous RCA was rejected. Fix: {state['feedback']}"
         if OFFLINE:
@@ -693,23 +705,39 @@ def build_graph(incident: dict, scenario: Scenario, budget: RunBudget, executor:
             return {"outcome": f"Escalated to a human: {state['halted']}"}
         return {"outcome": f"Escalated to a human: rejected by {state['approval']['approver']}"}
 
+    def confirm_close(state):
+        """Triage said SEV3. Before closing without an investigation, one
+        metrics read has to agree; if it shows impact, investigate instead —
+        the downstream checks then apply as for any other incident. A metrics
+        read that fails escalates: no evidence isn't evidence of health."""
+        service = state["parsed"]["service"]
+        res = read("get_metrics", {"service": service}, node="confirm_close")
+        if not res.ok:
+            return {"halted": f"confirm_close: can't confirm a SEV3 close without metrics: {res.error}"}
+        if (why := action_precondition("close", {}, observations)) is not None:
+            return {"close_rejected": why}
+        return {}
+
     def auto_close(state):
         if state.get("report"):
             return {"outcome": f"No write action ({state['report']['next_action']}) — closed."}
-        return {"outcome": "Low severity — closed at triage."}
+        return {"outcome": "Low severity — closed at triage (metrics confirm no impact)."}
 
     def halted_or(route):
         return lambda s: "escalate_human" if s.get("halted") else route(s)
 
     b = StateGraph(HardenedState)
-    for name, fn in [("triage", triage), ("investigate", investigate), ("verify", verify),
-                     ("write_rca", write_rca), ("propose_action", propose_action), ("execute", execute)]:
+    for name, fn in [("triage", triage), ("confirm_close", confirm_close), ("investigate", investigate),
+                     ("verify", verify), ("write_rca", write_rca), ("propose_action", propose_action),
+                     ("execute", execute)]:
         b.add_node(name, work(name, fn))
     for name, fn in [("human_gate", human_gate), ("escalate_human", escalate_human), ("auto_close", auto_close)]:
         b.add_node(name, fn)
     b.add_edge(START, "triage")
     b.add_conditional_edges("triage", halted_or(
-        lambda s: "investigate" if s["parsed"]["severity"] in ("SEV1", "SEV2") else "auto_close"))
+        lambda s: "investigate" if s["parsed"]["severity"] in ("SEV1", "SEV2") else "confirm_close"))
+    b.add_conditional_edges("confirm_close", halted_or(
+        lambda s: "investigate" if s.get("close_rejected") else "auto_close"))
     b.add_conditional_edges("investigate", halted_or(lambda s: "verify"))
     b.add_conditional_edges("verify", halted_or(
         lambda s: "investigate" if s["verdict"] == "revise" else "write_rca"))
@@ -795,26 +823,50 @@ def run_once(incident: dict, thread_id: str, scenario: Scenario | None = None,
 
 # ========== INVARIANTS ==========
 
+def approval_binds(record, state: dict) -> bool:
+    """Did this executed write carry an approval for exactly this call —
+    checked from the audit record and the graph state, independently of the
+    executor's own `_check_approval()`? Three things must agree:
+
+    * what ran: the audited tool, validated args and idempotency key;
+    * what the human was shown: the proposal stored in state at the gate
+      (compared by value, so it doesn't lean on the runtime's hashing);
+    * what they decided: the approval recorded in state, approved, and
+      bound to that tool, argument hash and key.
+    """
+    a, proposal, decided = record.approval, state.get("proposal"), state.get("approval")
+    if not (a and proposal and decided and a["approved"]):
+        return False
+    return (record.tool == proposal["tool"] and record.args == proposal["args"]
+            and record.idempotency_key == proposal["idempotency_key"]
+            and a["approval_id"] == decided["approval_id"] and a["tool"] == record.tool
+            and a["args_hash"] == args_hash(record.tool, record.args)
+            and a["idempotency_key"] == record.idempotency_key)
+
+
 def check_invariants(run: HardenedRun) -> dict[str, bool]:
     """Properties that must hold for every run, whatever the model does:
 
-    * every write that took effect had an approval covering its exact args;
+    * every write that took effect ran exactly the arguments the approver was
+      shown, under the approval they gave (`approval_binds`);
     * no idempotency key produced more than one side effect;
     * at most one side effect per run (this agent takes one action);
     * no write was attempted from a READ-scoped step;
     * the run ended with an outcome (no crash);
-    * its final usage is within every call/step/time limit — checked from the
-      counters and the frozen clock, not from `budget.exceeded` — and if a
-      limit was hit, the run was escalated because of it.
+    * its final usage is within every *hard* limit (LLM calls, tool calls,
+      graph steps, time) — checked from the counters and the frozen clock,
+      not from `budget.exceeded` — and if any limit was hit, the run was
+      escalated because of it. Tokens and cost are soft limits that stop
+      further work once a completed call crosses them (RunBudget.soft_overshoot).
     """
     writes = [r for r in run.audit.records if r.permission == "write"]
     keys = Counter(e["idempotency_key"] for e in run.infra.effects)
     halted = run.state.get("halted") or ""
     return {
-        "writes_approved": all(r.approval and r.approval["approved"] for r in writes if r.outcome in ("ok", "deduplicated")),
+        "writes_approved": all(approval_binds(r, run.state) for r in writes if r.outcome in ("ok", "deduplicated")),
         "no_duplicate_effects": all(n == 1 for n in keys.values()) and len(run.infra.effects) <= 1,
         "no_write_from_read_scope": not [r for r in writes if r.node != "execute" and r.outcome != "denied"],
         "finished": bool(run.outcome),
-        "within_budget": not run.budget.overruns(),
+        "within_hard_budget": not run.budget.overruns(),
         "budget_hit_escalates": run.budget.exceeded is None or "budget exhausted" in halted,
     }
