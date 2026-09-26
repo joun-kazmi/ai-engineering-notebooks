@@ -12,8 +12,8 @@ over HTTP:
   POST /approve          decide on that proposal. `args_hash` must name the
                          proposal the approver reviewed, or it's a 409. The
                          same decision submitted twice returns the stored
-                         result without acting again; a different second
-                         decision is a 409.
+                         result without acting again; a different decision,
+                         or another approver, is a 409.
   GET  /runs/{thread_id} status, outcome, budget and the run's audit log.
   POST /generate         a plain chat completion (not the agent).
 
@@ -58,8 +58,11 @@ class ServedRun:
         self.infra = ar.InfraSimulator.for_catalog(CATALOG)
         self.run = ar.RunHandle(alert, self.thread_id, ar.catalog_registry(CATALOG, self.infra, ar.Scenario()),
                                 self.infra, audit=AuditLog())
-        self.lock = threading.Lock()  # one decision at a time per run
-        self.decision: dict | None = None  # {"approved", "args_hash", "response"} once decided
+        # Held while the run executes (start, resume) and while it's read, so a
+        # reader sees one consistent point in time: the graph state, audit log
+        # and side effects all from before an approval executes, or all after.
+        self.lock = threading.Lock()
+        self.decision: dict | None = None  # {"approved", "args_hash", "approver", "response"} once decided
 
 
 RUNS: dict[str, ServedRun] = {}
@@ -102,12 +105,13 @@ class GenerateRequest(BaseModel):
 @app_fastapi.post("/alert")
 def receive_alert(payload: AlertPayload):
     served = ServedRun(payload.alert_text)
-    RUNS[served.thread_id] = served
-    try:
-        served.run.start()
-    except Exception as e:  # graph nodes already turn failures into escalations; this is a bug
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-    return _summary(served)
+    with served.lock:  # visible in RUNS only as a run in progress, never half-started
+        RUNS[served.thread_id] = served
+        try:
+            served.run.start()
+        except Exception as e:  # graph nodes already turn failures into escalations; this is a bug
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+        return _summary(served)
 
 
 @app_fastapi.post("/approve")
@@ -118,11 +122,18 @@ def approve_action(payload: ApprovalPayload):
 
     with served.lock:
         if served.decision is not None:
+            # A replay is the same approver resubmitting the same decision on the
+            # same proposal (double click, client retry): same answer, no second
+            # action. Anyone else — or a different decision — is told it's taken.
+            # `approver` is caller-supplied for now; once there's auth it should
+            # come from the authenticated identity, not the JSON body.
             same = (served.decision["approved"] == payload.approved
-                    and served.decision["args_hash"] == payload.args_hash)
+                    and served.decision["args_hash"] == payload.args_hash
+                    and served.decision["approver"] == payload.approver)
             if not same:
-                raise HTTPException(status_code=409, detail="This run was already decided differently")
-            # A retried submit (double click, client retry): same answer, no second action.
+                raise HTTPException(status_code=409, detail={
+                    "error": "This run was already decided",
+                    "decided_by": served.decision["approver"], "approved": served.decision["approved"]})
             return {**served.decision["response"], "replayed": True}
 
         proposal = served.run.pending_proposal
@@ -135,7 +146,8 @@ def approve_action(payload: ApprovalPayload):
 
         served.run.resume(payload.approved, payload.approver)
         response = {**_summary(served), "approved_by": payload.approver if payload.approved else None}
-        served.decision = {"approved": payload.approved, "args_hash": payload.args_hash, "response": response}
+        served.decision = {"approved": payload.approved, "args_hash": payload.args_hash,
+                           "approver": payload.approver, "response": response}
         return {**response, "replayed": False}
 
 
@@ -144,9 +156,12 @@ def get_run(thread_id: str):
     served = RUNS.get(thread_id)
     if served is None:
         raise HTTPException(status_code=404, detail="Thread not found")
-    return {**_summary(served), "budget": served.run.budget.snapshot(),
-            "audit": [r.to_dict() for r in served.run.executor.audit.records],
-            "side_effects": served.infra.effects}
+    # Waits while the run is executing (e.g. an approval being carried out), so
+    # the status, audit log and side effects all describe the same moment.
+    with served.lock:
+        return {**_summary(served), "budget": served.run.budget.snapshot(),
+                "audit": [r.to_dict() for r in served.run.executor.audit.records],
+                "side_effects": list(served.infra.effects)}
 
 
 _llm_client = None

@@ -4,6 +4,7 @@ conftest.py blanks every API key, so the hardened graph runs with the
 rule-based stand-ins; the HTTP contract around the approval gate is what's
 under test here.
 """
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -86,7 +87,7 @@ def test_a_different_second_decision_is_refused(client):
     run = alert(client)
     approve(client, run, approved=False)
     resp = approve(client, run, approved=True)
-    assert resp.status_code == 409 and "already decided differently" in resp.json()["detail"]
+    assert resp.status_code == 409 and resp.json()["detail"]["decided_by"] == "alice"
     assert not side_effects(run)
 
 
@@ -140,3 +141,47 @@ def test_approval_payload_requires_the_args_hash(client):
 
 def test_generate_without_a_key_is_503(client):
     assert client.post("/generate", json={"prompt": "hi"}).status_code == 503
+
+
+def test_another_approver_is_not_a_replay(client):
+    run = alert(client)
+    assert approve(client, run, approver="alice").json()["replayed"] is False
+    bob = approve(client, run, approver="bob")
+    assert bob.status_code == 409 and bob.json()["detail"] == {
+        "error": "This run was already decided", "decided_by": "alice", "approved": True}
+    assert approve(client, run, approver="alice").json()["replayed"] is True  # alice retrying is
+    assert len(side_effects(run)) == 1
+
+
+def test_run_snapshot_is_never_taken_mid_execution(client):
+    """The rollback takes effect, then the write blocks. A GET issued then
+    must not report the run as still awaiting approval next to a side effect
+    that already happened: it waits, and sees the finished run."""
+    run = alert(client)
+    infra = serve.RUNS[run["thread_id"]].infra
+    applied, release = threading.Event(), threading.Event()
+    real_rollback = infra.rollback
+
+    def slow_rollback(*args):
+        result = real_rollback(*args)  # the side effect exists from here on
+        applied.set()
+        release.wait(timeout=3)
+        return result
+
+    infra.rollback = slow_rollback
+    approval = threading.Thread(target=approve, args=(client, run))
+    approval.start()
+    assert applied.wait(timeout=3)
+
+    snapshots = []
+    reader = threading.Thread(target=lambda: snapshots.append(client.get(f"/runs/{run['thread_id']}").json()))
+    reader.start()
+    reader.join(timeout=0.3)
+    assert reader.is_alive(), "GET returned while the approval was still executing"
+
+    release.set()
+    approval.join(timeout=3)
+    reader.join(timeout=3)
+    [snap] = snapshots
+    assert snap["status"] == "completed" and len(snap["side_effects"]) == 1
+    assert any(r["permission"] == "write" for r in snap["audit"])
