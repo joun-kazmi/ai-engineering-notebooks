@@ -10,3 +10,4 @@ chroma_db/
 .DS_Store
 .idea/
 .vscode/
+.data/

@@ -199,6 +199,7 @@ class InfraSimulator:
             self.deployed[incident["service"]] = incident["fixtures"]["deploys"][0]["version"]
         self.effects: list[dict] = []
         self._keys: dict[str, dict] = {}
+        self.on_change: Callable[["InfraSimulator"], None] | None = None  # e.g. persist after each write
         self._lock = threading.Lock()
 
     @classmethod
@@ -214,7 +215,21 @@ class InfraSimulator:
             self.effects.append({**result, "idempotency_key": key})
             if key:
                 self._keys[key] = result
+            # Inside the lock, right after the write commits: a real backend's
+            # key store is durable, and a crash-recovered run relies on it.
+            if self.on_change is not None:
+                self.on_change(self)
             return result
+
+    def to_dict(self) -> dict:
+        return {"honor_keys": self.honor_keys, "deployed": self.deployed, "effects": self.effects, "keys": self._keys}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "InfraSimulator":
+        infra = cls(honor_keys=data["honor_keys"], deployed=data["deployed"])
+        infra.effects = list(data["effects"])
+        infra._keys = dict(data["keys"])
+        return infra
 
     def rollback(self, service: str, from_version: str, key: str | None) -> dict:
         def apply():
@@ -415,6 +430,11 @@ class HardenedState(TypedDict, total=False):
     approval: dict
     halted: str      # why the run stopped early (budget, contract, failed write); routes to escalate_human
     close_rejected: str  # why a SEV3 triage close was overruled by the metrics; routes to investigate
+    # The evidence gathered so far (latest output per read tool) and the
+    # service every read targeted. Kept in state so it's checkpointed: a run
+    # recovered after a crash continues with its evidence, not without it.
+    observations: dict
+    targets: list
     outcome: str
 
 
@@ -576,7 +596,7 @@ LIVE_SYSTEM = ("You investigate production incidents. Use your tools to gather e
 
 
 def build_graph(scenario: Scenario, budget: RunBudget, executor: ToolExecutor,
-                observations: dict, llm: BudgetedChatClient | None = None):
+                observations: dict, llm: BudgetedChatClient | None = None, checkpointer=None):
     """`observations` collects the latest successful output of each read
     tool, for the OFFLINE RCA and the pre-gate checks. `llm` is required in
     LIVE mode."""
@@ -605,13 +625,18 @@ def build_graph(scenario: Scenario, budget: RunBudget, executor: ToolExecutor,
         """Charge a graph step; turn a budget hit or any node failure into a
         `halted` reason (-> escalate_human) instead of a crashed run."""
         def node(state):
+            # Evidence lives in state (checkpointed); the closures work on a copy.
+            observations.clear()
+            observations.update(state.get("observations") or {})
+            targets[:] = state.get("targets") or []
             try:
                 budget.charge_graph_step()
-                return fn(state)
+                update = fn(state)
             except BudgetExceeded as e:
-                return {"halted": f"{name}: {e}"}
+                update = {"halted": f"{name}: {e}"}
             except Exception as e:
-                return {"halted": f"{name}: {type(e).__name__}: {str(e)[:200]}"}
+                update = {"halted": f"{name}: {type(e).__name__}: {str(e)[:200]}"}
+            return {**update, "observations": dict(observations), "targets": list(targets)}
         return node
 
     def triage(state):
@@ -784,7 +809,9 @@ def build_graph(scenario: Scenario, budget: RunBudget, executor: ToolExecutor,
     b.add_conditional_edges("execute", halted_or(lambda s: END))
     b.add_edge("escalate_human", END)
     b.add_edge("auto_close", END)
-    return b.compile(checkpointer=InMemorySaver())
+    # A durable checkpointer (e.g. SqliteSaver) lets a run paused at the gate
+    # survive a restart, and a crashed run continue from its last node.
+    return b.compile(checkpointer=checkpointer if checkpointer is not None else InMemorySaver())
 
 
 def _investigate_live(task: str, schemas: list[dict], read, llm, max_iterations: int = 10) -> str:
@@ -819,18 +846,26 @@ class RunHandle:
     halves can happen in different requests (the served agent):
     `start()` runs until the gate or the end; `resume()` delivers the human's
     decision. Everything the run owns — graph, budget, executor with its
-    audit log and idempotency ledger, simulator — lives here, in memory."""
+    audit log and idempotency ledger, simulator — lives here, in memory,
+    unless the caller persists it: pass a durable `checkpointer` and a
+    restored `budget` / `executor_state` to continue a run in a new process,
+    then `load()` it from its checkpoint."""
 
     def __init__(self, alert: str, thread_id: str, registry: ToolRegistry, infra: InfraSimulator,
                  scenario: Scenario | None = None, audit: AuditLog | None = None,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep, checkpointer=None,
+                 budget: RunBudget | None = None, executor_state: dict | None = None):
         self.alert, self.thread_id, self.infra = alert, thread_id, infra
         self.scenario = scenario or Scenario()
-        self.budget = RunBudget(self.scenario.limits, settings.llm_usd_per_mtok_in, settings.llm_usd_per_mtok_out)
+        self.budget = budget or RunBudget(self.scenario.limits, settings.llm_usd_per_mtok_in,
+                                          settings.llm_usd_per_mtok_out)
         self.executor = ToolExecutor(registry, thread_id, self.budget,
                                      audit if audit is not None else AuditLog(), sleep=sleep)
+        if executor_state:
+            self.executor.restore(executor_state)
         self.llm = None if OFFLINE else BudgetedChatClient(_hardened_client(), self.budget)
-        self.app = build_graph(self.scenario, self.budget, self.executor, observations={}, llm=self.llm)
+        self.app = build_graph(self.scenario, self.budget, self.executor, observations={}, llm=self.llm,
+                               checkpointer=checkpointer)
         # Graph steps are budgeted, so recursion_limit is only a backstop.
         self.config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
         self.state: dict = {}
@@ -840,6 +875,26 @@ class RunHandle:
         """The proposal waiting at the approval gate, if the run is paused there."""
         interrupts = self.state.get("__interrupt__")
         return interrupts[0].value["proposal"] if interrupts else None
+
+    def load(self) -> tuple[str, ...]:
+        """Read the run's state back from its checkpoint (a new process, after
+        a restart). Returns the nodes that would run next: empty when it
+        finished, ("human_gate",) when it's paused for approval."""
+        snap = self.app.get_state(self.config)
+        self.state = dict(snap.values)
+        if snap.interrupts:
+            self.state["__interrupt__"] = list(snap.interrupts)
+        return snap.next
+
+    def recover(self) -> dict:
+        """Continue a run whose process died mid-execution, from its last
+        checkpoint. The node that was running re-runs from the start, so a
+        write it had already made is sent again with the same idempotency
+        key, and the backend answers it as a duplicate instead of acting."""
+        self.state = self.app.invoke(None, self.config)
+        if self.pending_proposal is None:
+            self._finish()
+        return self.state
 
     def start(self) -> dict:
         self.state = self.app.invoke({"alert": self.alert, "attempts": 0, "evidence": []}, self.config)

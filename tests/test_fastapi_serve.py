@@ -1,8 +1,9 @@
 """Offline tests for the served escalation agent (src/fastapi_serve.py).
 
 conftest.py blanks every API key, so the hardened graph runs with the
-rule-based stand-ins; the HTTP contract around the approval gate is what's
-under test here.
+rule-based stand-ins; the HTTP contract around the approval gate and the
+durability of runs are what's under test here. A "restart" is a new Service
+on the same SQLite file; "two processes" are two Services sharing one.
 """
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -11,14 +12,39 @@ import pytest
 from fastapi.testclient import TestClient
 
 import ai_engineering.agent_eval as ae
+import ai_engineering.agent_reliability as ar
 import src.fastapi_serve as serve
+from ai_engineering.tool_runtime import RunBudget, ToolExecutor
 
 INC = {i["id"]: i for i in ae.load_incidents()}
 
 
+class Clock:
+    def __init__(self, t=1_000_000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
 @pytest.fixture
-def client():
-    serve.RUNS.clear()
+def db(tmp_path):
+    return tmp_path / "serve.sqlite3"
+
+
+@pytest.fixture
+def clock():
+    return Clock()
+
+
+def restart(db, clock):
+    """A new process on the same database."""
+    return serve.configure(db, clock=clock, approval_ttl_s=3600, retention_s=86400, lease_s=300)
+
+
+@pytest.fixture
+def client(db, clock):
+    restart(db, clock)
     return TestClient(serve.app_fastapi)
 
 
@@ -34,9 +60,15 @@ def approve(client, run, approved=True, approver="alice", args_hash=None):
         "args_hash": args_hash or run["proposal"]["args_hash"]})
 
 
-def side_effects(run):
-    return serve.RUNS[run["thread_id"]].infra.effects
+def get(client, run):
+    return client.get(f"/runs/{run['thread_id']}").json()
 
+
+def side_effects(client, run):
+    return get(client, run)["side_effects"]
+
+
+# ---- the approval contract
 
 def test_service_imports_without_an_api_key():
     assert ae.OFFLINE, "the served agent must run offline when no key is configured"
@@ -49,7 +81,7 @@ def test_alert_returns_the_validated_proposal(client):
     assert p["tool"] == "rollback_deploy"
     assert p["args"] == {"service": "payments-api", "from_version": "v2.14.3"}
     assert len(p["args_hash"]) == 16 and len(p["idempotency_key"]) == 32
-    assert not side_effects(run)  # nothing happens before approval
+    assert not side_effects(client, run)  # nothing happens before approval
 
 
 def test_approval_executes_exactly_the_proposal(client):
@@ -59,7 +91,7 @@ def test_approval_executes_exactly_the_proposal(client):
     body = resp.json()
     assert body["status"] == "completed" and body["replayed"] is False and body["approved_by"] == "alice"
     assert "v2.14.3 -> v2.14.2" in body["outcome"]
-    [write] = [r for r in client.get(f"/runs/{run['thread_id']}").json()["audit"] if r["permission"] == "write"]
+    [write] = [r for r in get(client, run)["audit"] if r["permission"] == "write"]
     assert write["args"] == run["proposal"]["args"]
     assert write["approval"]["approver"] == "alice"
     assert write["approval"]["args_hash"] == run["proposal"]["args_hash"]
@@ -70,8 +102,8 @@ def test_approval_for_other_args_is_refused_and_the_run_stays_pending(client):
     resp = approve(client, run, args_hash="0" * 16)
     assert resp.status_code == 409
     assert resp.json()["detail"]["proposal"] == run["proposal"]
-    assert not side_effects(run)
-    assert client.get(f"/runs/{run['thread_id']}").json()["status"] == "awaiting_approval"
+    assert not side_effects(client, run)
+    assert get(client, run)["status"] == "awaiting_approval"
     assert approve(client, run).status_code == 200  # the right hash still works
 
 
@@ -80,7 +112,7 @@ def test_same_decision_twice_replays_without_acting_again(client):
     first, second = approve(client, run).json(), approve(client, run).json()
     assert second["replayed"] is True
     assert {k: v for k, v in second.items() if k != "replayed"} == {k: v for k, v in first.items() if k != "replayed"}
-    assert len(side_effects(run)) == 1
+    assert len(side_effects(client, run)) == 1
 
 
 def test_a_different_second_decision_is_refused(client):
@@ -88,7 +120,17 @@ def test_a_different_second_decision_is_refused(client):
     approve(client, run, approved=False)
     resp = approve(client, run, approved=True)
     assert resp.status_code == 409 and resp.json()["detail"]["decided_by"] == "alice"
-    assert not side_effects(run)
+    assert not side_effects(client, run)
+
+
+def test_another_approver_is_not_a_replay(client):
+    run = alert(client)
+    assert approve(client, run, approver="alice").json()["replayed"] is False
+    bob = approve(client, run, approver="bob")
+    assert bob.status_code == 409 and bob.json()["detail"] == {
+        "error": "This run was already decided", "decided_by": "alice", "approved": True}
+    assert approve(client, run, approver="alice").json()["replayed"] is True  # alice retrying is
+    assert len(side_effects(client, run)) == 1
 
 
 def test_concurrent_approvals_act_once(client):
@@ -97,14 +139,14 @@ def test_concurrent_approvals_act_once(client):
         responses = list(pool.map(lambda _: approve(client, run), range(8)))
     assert all(r.status_code == 200 for r in responses)
     assert sum(not r.json()["replayed"] for r in responses) == 1
-    assert len(side_effects(run)) == 1
+    assert len(side_effects(client, run)) == 1
 
 
 def test_rejection_escalates_with_no_write(client):
     run = alert(client)
     body = approve(client, run, approved=False, approver="sre-lead").json()
     assert body["status"] == "escalated" and body["outcome"] == "Escalated to a human: rejected by sre-lead"
-    assert body["approved_by"] is None and not side_effects(run)
+    assert body["approved_by"] is None and not side_effects(client, run)
 
 
 def test_sev3_alert_closes_after_a_metrics_check_and_has_nothing_to_approve(client):
@@ -116,17 +158,16 @@ def test_sev3_alert_closes_after_a_metrics_check_and_has_nothing_to_approve(clie
 
 
 def test_unknown_service_escalates(client):
-    resp = client.post("/alert", json={"alert_text": "billing-api error rate spiking after deploy, customers affected"})
-    run = resp.json()
+    run = client.post("/alert", json={"alert_text": "billing-api error rate spiking after deploy, customers affected"}).json()
     assert run["status"] == "escalated" and "billing-api" not in serve.CATALOG
-    audit = client.get(f"/runs/{run['thread_id']}").json()["audit"]
+    audit = get(client, run)["audit"]
     assert audit and all(r["outcome"] in ("failed", "circuit_open") for r in audit)
     assert "404" in audit[0]["error"] and audit[0]["attempts"] == 1  # a 404 isn't retried
 
 
 def test_run_endpoint_reports_budget_and_audit(client):
     run = alert(client, "inc02")
-    body = client.get(f"/runs/{run['thread_id']}").json()
+    body = get(client, run)
     assert body["status"] == "awaiting_approval" and body["proposal"]["args"]["team"] == "db-team"
     assert body["budget"]["tool_calls"].startswith("5/")
     assert {r["tool"] for r in body["audit"]} == set(ae.TOOLS)
@@ -143,45 +184,170 @@ def test_generate_without_a_key_is_503(client):
     assert client.post("/generate", json={"prompt": "hi"}).status_code == 503
 
 
-def test_another_approver_is_not_a_replay(client):
-    run = alert(client)
-    assert approve(client, run, approver="alice").json()["replayed"] is False
-    bob = approve(client, run, approver="bob")
-    assert bob.status_code == 409 and bob.json()["detail"] == {
-        "error": "This run was already decided", "decided_by": "alice", "approved": True}
-    assert approve(client, run, approver="alice").json()["replayed"] is True  # alice retrying is
-    assert len(side_effects(run)) == 1
+# ---- the run lifecycle
 
-
-def test_run_snapshot_is_never_taken_mid_execution(client):
-    """The rollback takes effect, then the write blocks. A GET issued then
-    must not report the run as still awaiting approval next to a side effect
-    that already happened: it waits, and sees the finished run."""
+def test_a_read_during_execution_says_executing_without_waiting(client, monkeypatch):
+    """While an approval is being carried out, GET doesn't block and doesn't
+    mix states: it reports `executing`, then the settled run."""
     run = alert(client)
-    infra = serve.RUNS[run["thread_id"]].infra
     applied, release = threading.Event(), threading.Event()
-    real_rollback = infra.rollback
+    real_rollback = ar.InfraSimulator.rollback
 
-    def slow_rollback(*args):
-        result = real_rollback(*args)  # the side effect exists from here on
+    def slow_rollback(self, *args):
+        result = real_rollback(self, *args)  # the side effect exists from here on
         applied.set()
         release.wait(timeout=3)
         return result
 
-    infra.rollback = slow_rollback
+    monkeypatch.setattr(ar.InfraSimulator, "rollback", slow_rollback)
     approval = threading.Thread(target=approve, args=(client, run))
     approval.start()
-    assert applied.wait(timeout=3)
+    try:
+        assert applied.wait(timeout=3)
+        during = get(client, run)  # returns immediately
+        assert during["status"] == "executing" and "proposal" not in during
+        # The same approver retrying meanwhile: told it's executing; nothing re-runs.
+        assert approve(client, run).json() == {"status": "executing", "thread_id": run["thread_id"], "replayed": True}
+    finally:
+        release.set()
+        approval.join(timeout=3)
+    after = get(client, run)
+    assert after["status"] == "completed" and len(after["side_effects"]) == 1
 
-    snapshots = []
-    reader = threading.Thread(target=lambda: snapshots.append(client.get(f"/runs/{run['thread_id']}").json()))
-    reader.start()
-    reader.join(timeout=0.3)
-    assert reader.is_alive(), "GET returned while the approval was still executing"
 
-    release.set()
-    approval.join(timeout=3)
-    reader.join(timeout=3)
-    [snap] = snapshots
-    assert snap["status"] == "completed" and len(snap["side_effects"]) == 1
-    assert any(r["permission"] == "write" for r in snap["audit"])
+def test_undecided_proposal_expires(client, clock):
+    run = alert(client)
+    clock.t += 3601
+    assert get(client, run)["status"] == "expired"
+    resp = approve(client, run)
+    assert resp.status_code == 410 and resp.json()["detail"]["proposal"] == run["proposal"]
+    assert not side_effects(client, run)
+
+
+def test_settled_runs_are_purged_with_their_checkpoints(client, clock):
+    done = alert(client, "inc03")
+    pending = alert(client)
+    clock.t += 86400 + 1
+    client.post("/alert", json={"alert_text": INC["inc03"]["alert"]})  # housekeeping runs on each request
+    assert client.get(f"/runs/{done['thread_id']}").status_code == 404
+    checkpointer = serve.service().checkpointer
+    assert checkpointer.get_tuple({"configurable": {"thread_id": done["thread_id"]}}) is None
+    # An expired proposal stays visible for the retention period after it expired, then goes too.
+    assert get(client, pending)["status"] == "expired"
+    clock.t += 86400 + 1
+    assert client.get(f"/runs/{pending['thread_id']}").status_code == 404
+
+
+# ---- durability
+
+def test_pending_approval_survives_a_restart(client, db, clock):
+    run = alert(client)
+    restart(db, clock)
+    body = approve(client, run).json()
+    assert body["status"] == "completed" and "v2.14.3 -> v2.14.2" in body["outcome"]
+    after = get(client, run)
+    assert after["budget"]["tool_calls"].startswith("6/")  # 5 before the restart, 1 after
+    assert [r["node"] for r in after["audit"]] == ["investigate"] * 5 + ["execute"]
+    assert len(after["side_effects"]) == 1
+
+
+def test_two_processes_approving_at_once_act_once(client, db, clock):
+    run = alert(client)
+    a, b = restart(db, clock), restart(db, clock)
+    barrier = threading.Barrier(2)
+
+    def approve_via(svc):
+        barrier.wait()
+        return svc.approve(run["thread_id"], True, "alice", run["proposal"]["args_hash"])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(approve_via, [a, b]))
+    assert sorted(r["replayed"] for r in results) == [False, True]
+    assert len(side_effects(client, run)) == 1
+
+
+class SimulatedCrash(BaseException):
+    """Escapes every `except Exception`, like the process dying."""
+
+
+def test_crash_mid_write_recovers_without_a_second_rollback(client, db, clock, monkeypatch):
+    """The rollback commits at the backend, then the process dies before the
+    executor records it. After a restart the run is found silent, marked
+    interrupted, and recovered from its checkpoint: execute re-runs, the write
+    is re-sent with the same idempotency key, and the backend answers it as a
+    duplicate."""
+    run = alert(client)
+    real_rollback = ar.InfraSimulator.rollback
+
+    def rollback_then_crash(self, *args):
+        real_rollback(self, *args)
+        raise SimulatedCrash()
+
+    monkeypatch.setattr(ar.InfraSimulator, "rollback", rollback_then_crash)
+    with pytest.raises(SimulatedCrash):
+        serve.service().approve(run["thread_id"], True, "alice", run["proposal"]["args_hash"])
+    monkeypatch.setattr(ar.InfraSimulator, "rollback", real_rollback)
+
+    restart(db, clock)
+    assert get(client, run)["status"] == "executing"  # within the lease: presumed still running
+    clock.t += 301
+    stuck = get(client, run)
+    assert stuck["status"] == "interrupted" and "/recover" in stuck["detail"]
+    assert len(stuck["side_effects"]) == 1  # the rollback did happen
+
+    recovered = client.post(f"/runs/{run['thread_id']}/recover").json()
+    assert recovered["status"] == "completed" and recovered["approved_by"] == "alice"
+    assert recovered["outcome"].startswith("deduplicated: v2.14.3 -> v2.14.2")
+    after = get(client, run)
+    assert len(after["side_effects"]) == 1  # not rolled back twice
+    # Retrying the original approval now replays the recovered result.
+    assert approve(client, run).json()["replayed"] is True
+    assert client.post(f"/runs/{run['thread_id']}/recover").status_code == 409
+
+
+def test_crash_mid_investigation_recovers_to_the_gate(client, db, clock, monkeypatch):
+    """A crash before any write: recovery continues from the last checkpoint
+    and stops at the approval gate as usual."""
+    real_call, calls = ToolExecutor.call, {"n": 0}
+
+    def crash_on_third_call(self, name, raw_args, **kw):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise SimulatedCrash()
+        return real_call(self, name, raw_args, **kw)
+
+    monkeypatch.setattr(ToolExecutor, "call", crash_on_third_call)
+    with pytest.raises(SimulatedCrash):
+        serve.service().alert(INC["inc01"]["alert"])
+    monkeypatch.setattr(ToolExecutor, "call", real_call)
+    [row] = serve.service().store._exec("SELECT thread_id FROM runs").fetchall()
+    run = {"thread_id": row["thread_id"]}
+
+    restart(db, clock)
+    clock.t += 301
+    assert get(client, run)["status"] == "interrupted"
+    recovered = client.post(f"/runs/{run['thread_id']}/recover").json()
+    assert recovered["status"] == "awaiting_approval"
+    assert recovered["proposal"]["args"] == {"service": "payments-api", "from_version": "v2.14.3"}
+    assert approve(client, {**run, "proposal": recovered["proposal"]}).json()["status"] == "completed"
+
+
+def test_budget_round_trips_and_keeps_counting():
+    budget = RunBudget(ar.DEFAULT_LIMITS)
+    budget.charge_tool_call()
+    budget.charge_graph_step()
+    budget.suspend()
+    restored = RunBudget.from_dict(budget.to_dict(), ar.DEFAULT_LIMITS)
+    assert (restored.tool_calls, restored.graph_steps) == (1, 1)
+    assert restored.to_dict()["suspended"] is True
+    restored.resume()
+    restored.charge_tool_call()
+    assert restored.tool_calls == 2
+
+
+def test_simulated_backend_round_trips_its_key_store():
+    infra = ar.InfraSimulator(INC["inc01"])
+    infra.rollback("payments-api", "v2.14.3", key="k1")
+    restored = ar.InfraSimulator.from_dict(infra.to_dict())
+    again = restored.rollback("payments-api", "v2.14.3", key="k1")
+    assert again["deduplicated"] is True and len(restored.effects) == 1

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import SecretStr, field_validator
+from pydantic_core import PydanticUseDefault
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repo root, regardless of the caller's working directory — same convention
@@ -104,6 +105,16 @@ class Settings(BaseSettings):
     llm_usd_per_mtok_in: float | None = None
     llm_usd_per_mtok_out: float | None = None
 
+    # The served agent (src/fastapi_serve.py): where runs and graph checkpoints
+    # are stored (relative paths are from the repo root), how long a proposal
+    # waits for approval before it goes stale, how long settled runs are kept,
+    # and how long a running run may go without writing before it's presumed
+    # dead (its process crashed) and marked interrupted.
+    serve_db_path: str = ".data/serve.sqlite3"
+    approval_ttl_s: float = 24 * 3600
+    run_retention_s: float = 7 * 24 * 3600
+    run_lease_s: float = 300
+
     langfuse_public_key: SecretStr | None = None
     langfuse_secret_key: SecretStr | None = None
     langfuse_base_url: str = "https://cloud.langfuse.com"
@@ -121,6 +132,14 @@ class Settings(BaseSettings):
         # must mean "not configured" (offline fallback), not an empty key -> 401.
         if isinstance(v, str) and not v.strip():
             return None
+        return v
+
+    @field_validator("serve_db_path", "approval_ttl_s", "run_retention_s", "run_lease_s", mode="before")
+    @classmethod
+    def _blank_is_default(cls, v):
+        # Same idea for settings that have a default rather than meaning "off".
+        if isinstance(v, str) and not v.strip():
+            raise PydanticUseDefault()
         return v
 
     @property
@@ -160,6 +179,11 @@ class Settings(BaseSettings):
                 f"Set it in .env, or set LLM_PROVIDER to a provider you do have a key for."
             )
         return self.api_key.get_secret_value()
+
+    @property
+    def resolved_serve_db_path(self) -> Path:
+        path = Path(self.serve_db_path)
+        return path if path.is_absolute() else _REPO_ROOT / path
 
     @property
     def langfuse_configured(self) -> bool:
