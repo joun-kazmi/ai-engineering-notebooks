@@ -5,6 +5,7 @@ openai==3.5.0
 
 # Orchestration / agents
 langgraph==1.2.11
+langgraph-checkpoint-sqlite==3.1.1   # durable checkpoints for the served agent
 langchain-core==1.6.0
 langchain-openai==1.6.0
 
