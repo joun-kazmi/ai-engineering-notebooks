@@ -77,7 +77,7 @@ Multi-step agents on LangGraph, using incident response and support triage as th
 
 | File | What it covers |
 |---|---|
-| [`src/fastapi_serve.py`](src/fastapi_serve.py) | A LangGraph agent served over FastAPI, with checkpointing and human-in-the-loop interrupts |
+| [`src/fastapi_serve.py`](src/fastapi_serve.py) | The hardened escalation agent served over FastAPI. `/alert` returns the proposal waiting at the approval gate. `/approve` must name that proposal's `args_hash`, and a repeated submit replays the stored result instead of acting twice. `/runs/{id}` returns the budget and the audit log. |
 
 ---
 
@@ -223,7 +223,19 @@ To run the FastAPI service (from the repo root):
 uvicorn src.fastapi_serve:app_fastapi --reload
 ```
 
-`app_fastapi` is the FastAPI instance; `app` in the same module is the compiled LangGraph.
+`app_fastapi` is the FastAPI instance. `app` in the same module is the graph's structure, for introspection; each alert gets its own compiled copy, bound to that run's budget, executor and audit log. Without an API key the agent runs offline, with rule-based stand-ins. Its tools read a demo catalog built from `data/incident_eval_set.json` and write to an in-memory simulator.
+
+```bash
+curl -s -X POST localhost:8000/alert -H 'content-type: application/json' \
+  -d '{"alert_text": "checkout-api p95 latency 6s and timeouts on checkout, error rate climbing"}'
+# -> {"status": "awaiting_approval", "thread_id": "...", "proposal": {"tool": "page_oncall",
+#     "args": {"team": "db-team", ...}, "args_hash": "fd788be9149bbff0", ...}, ...}
+
+curl -s -X POST localhost:8000/approve -H 'content-type: application/json' \
+  -d '{"thread_id": "...", "approved": true, "approver": "alice", "args_hash": "fd788be9149bbff0"}'
+```
+
+Runs are kept in process memory for now, so a restart loses them.
 
 To run the offline smoke tests (no API keys or LLM calls; the same suite runs in CI):
 

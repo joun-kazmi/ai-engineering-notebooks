@@ -98,17 +98,11 @@ def test_documents_are_not_embedded_as_queries(path):
 
 
 @pytest.fixture(scope="module")
-def serve(monkeypatch_module):
-    monkeypatch_module.setenv("NVIDIA_API_KEY", "test-dummy-key")
+def serve():
+    # No key needed: the service creates its LLM client lazily, and without a
+    # key the agent runs offline (conftest.py blanks every key).
     import src.fastapi_serve as serve
     return serve
-
-
-@pytest.fixture(scope="module")
-def monkeypatch_module():
-    mp = pytest.MonkeyPatch()
-    yield mp
-    mp.undo()
 
 
 def test_readme_serve_command_targets_the_fastapi_app(serve):
@@ -121,14 +115,14 @@ def test_readme_serve_command_targets_the_fastapi_app(serve):
 
 def test_service_exposes_expected_routes(serve):
     paths = {r.path for r in serve.app_fastapi.routes}
-    assert {"/generate", "/alert", "/approve"} <= paths
+    assert {"/generate", "/alert", "/approve", "/runs/{thread_id}"} <= paths
 
 
 def test_approve_unknown_thread_returns_404(serve):
     from fastapi.testclient import TestClient
 
     resp = TestClient(serve.app_fastapi).post(
-        "/approve", json={"thread_id": "does-not-exist", "approved": True, "approver": "ci"}
+        "/approve", json={"thread_id": "does-not-exist", "approved": True, "approver": "ci", "args_hash": "x"}
     )
     assert resp.status_code == 404
 
