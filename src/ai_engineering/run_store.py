@@ -17,11 +17,29 @@ Status lifecycle:
 A run is claimed for execution with a compare-and-set on its status, so
 across threads *and* processes exactly one approval request executes it.
 Timestamps are wall-clock seconds (time.time()), comparable across processes.
+
+Fencing. Every claim (approval, recovery) and every stale-marking bumps the
+run's `epoch`. The process executing a run holds the epoch it claimed, and
+all its writes — state, audit, status — require that epoch to still be
+current (`FencedOut` otherwise). So a worker presumed dead that wakes up
+after its run was recovered elsewhere can't overwrite the recovered state:
+its first write fails and it stops. (With a real backend, the epoch would
+also be sent to it as a fencing token, so a stale worker's *side effect* is
+refused too; the simulated backend here is persisted through this store, so
+fencing the store fences it.)
 """
 import json
 import sqlite3
 import threading
 from pathlib import Path
+
+
+class FencedOut(BaseException):
+    """This process's claim on the run was revoked (the run was marked stale
+    or recovered elsewhere): stop executing it. A BaseException, so no
+    `except Exception` on the way — in a node, a tool call, a retry loop —
+    turns it into an ordinary failure that the stale worker then records."""
+
 
 FINAL = ("completed", "escalated", "expired")
 RUNNING = ("starting", "executing")
@@ -33,6 +51,7 @@ CREATE TABLE IF NOT EXISTS runs (
     thread_id  TEXT PRIMARY KEY,
     alert      TEXT NOT NULL,
     status     TEXT NOT NULL,
+    epoch      INTEGER NOT NULL DEFAULT 1,  -- fencing token: bumped on every claim
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     expires_at REAL,            -- awaiting_approval only: when the proposal goes stale
@@ -66,15 +85,26 @@ class RunStore:
         self._lock = threading.Lock()  # one statement at a time on this connection
 
     def _exec(self, sql: str, params=()) -> sqlite3.Cursor:
+        """For statements whose result is the rowcount."""
         with self._lock:
             return self._conn.execute(sql, params)
+
+    def _rows(self, sql: str, params=()) -> list[sqlite3.Row]:
+        """Fetch inside the lock: with UPDATE ... RETURNING the statement only
+        completes when its rows are read, and the connection is shared."""
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
+
+    def _row(self, sql: str, params=()) -> sqlite3.Row | None:
+        rows = self._rows(sql, params)
+        return rows[0] if rows else None
 
     def create(self, thread_id: str, alert: str, now: float) -> None:
         self._exec("INSERT INTO runs (thread_id, alert, status, created_at, updated_at) VALUES (?, ?, 'starting', ?, ?)",
                    (thread_id, alert, now, now))
 
     def get(self, thread_id: str) -> dict | None:
-        row = self._exec("SELECT * FROM runs WHERE thread_id = ?", (thread_id,)).fetchone()
+        row = self._row("SELECT * FROM runs WHERE thread_id = ?", (thread_id,))
         if row is None:
             return None
         run = dict(row)
@@ -83,30 +113,52 @@ class RunStore:
                 run[col] = json.loads(run[col])
         return run
 
-    def update(self, thread_id: str, now: float, **fields) -> None:
+    @staticmethod
+    def _values(fields: dict) -> list:
+        return [json.dumps(v) if k in _JSON_COLUMNS and v is not None else v for k, v in fields.items()]
+
+    def update(self, thread_id: str, now: float, epoch: int, **fields) -> None:
         """Set fields and bump updated_at, which doubles as the run's
-        heartbeat: a running run writes on every budget charge."""
+        heartbeat: a running run writes on every budget charge. Only while
+        `epoch` is current; otherwise FencedOut."""
         cols = [f"{k} = ?" for k in fields] + ["updated_at = ?"]
-        vals = [json.dumps(v) if k in _JSON_COLUMNS and v is not None else v for k, v in fields.items()]
-        self._exec(f"UPDATE runs SET {', '.join(cols)} WHERE thread_id = ?", (*vals, now, thread_id))
+        cur = self._exec(f"UPDATE runs SET {', '.join(cols)} WHERE thread_id = ? AND epoch = ?",
+                         (*self._values(fields), now, thread_id, epoch))
+        if cur.rowcount != 1:
+            raise FencedOut(f"run {thread_id}: epoch {epoch} is no longer current")
 
-    def transition(self, thread_id: str, from_status: str, to_status: str, now: float, **fields) -> bool:
-        """Compare-and-set the status. True if this caller won: the run was
-        in `from_status` and is now in `to_status`."""
+    def claim(self, thread_id: str, from_status: str, to_status: str, now: float, **fields) -> int | None:
+        """Compare-and-set the status and take a new epoch. Returns the epoch
+        this caller now holds, or None if it lost (the run wasn't in
+        `from_status`)."""
+        cols = ["status = ?", "epoch = epoch + 1"] + [f"{k} = ?" for k in fields] + ["updated_at = ?"]
+        row = self._row(f"UPDATE runs SET {', '.join(cols)} WHERE thread_id = ? AND status = ? RETURNING epoch",
+                        (to_status, *self._values(fields), now, thread_id, from_status))
+        return row["epoch"] if row else None
+
+    def settle(self, thread_id: str, epoch: int, from_status: str, to_status: str, now: float, **fields) -> None:
+        """Move a run this caller holds (by epoch) to its next status."""
         cols = ["status = ?"] + [f"{k} = ?" for k in fields] + ["updated_at = ?"]
-        vals = [to_status] + [json.dumps(v) if k in _JSON_COLUMNS and v is not None else v
-                              for k, v in fields.items()] + [now]
-        cur = self._exec(f"UPDATE runs SET {', '.join(cols)} WHERE thread_id = ? AND status = ?",
-                         (*vals, thread_id, from_status))
-        return cur.rowcount == 1
+        cur = self._exec(f"UPDATE runs SET {', '.join(cols)} WHERE thread_id = ? AND status = ? AND epoch = ?",
+                         (to_status, *self._values(fields), now, thread_id, from_status, epoch))
+        if cur.rowcount != 1:
+            raise FencedOut(f"run {thread_id}: epoch {epoch} is no longer current")
 
-    def append_audit(self, thread_id: str, record: dict) -> None:
-        self._exec("INSERT INTO audit (thread_id, seq, record) VALUES "
-                   "(?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM audit WHERE thread_id = ?), ?)",
-                   (thread_id, thread_id, json.dumps(record, default=str)))
+    def check_epoch(self, thread_id: str, epoch: int) -> None:
+        row = self._row("SELECT epoch FROM runs WHERE thread_id = ?", (thread_id,))
+        if row is None or row["epoch"] != epoch:
+            raise FencedOut(f"run {thread_id}: epoch {epoch} is no longer current")
+
+    def append_audit(self, thread_id: str, epoch: int, record: dict) -> None:
+        cur = self._exec("INSERT INTO audit (thread_id, seq, record) "
+                         "SELECT ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM audit WHERE thread_id = ?), ? "
+                         "WHERE EXISTS (SELECT 1 FROM runs WHERE thread_id = ? AND epoch = ?)",
+                         (thread_id, thread_id, json.dumps(record, default=str), thread_id, epoch))
+        if cur.rowcount != 1:
+            raise FencedOut(f"run {thread_id}: epoch {epoch} is no longer current")
 
     def audit(self, thread_id: str) -> list[dict]:
-        rows = self._exec("SELECT record FROM audit WHERE thread_id = ? ORDER BY seq", (thread_id,)).fetchall()
+        rows = self._rows("SELECT record FROM audit WHERE thread_id = ? ORDER BY seq", (thread_id,))
         return [json.loads(r["record"]) for r in rows]
 
     def expire_pending(self, now: float) -> int:
@@ -118,15 +170,16 @@ class RunStore:
     def mark_stale(self, now: float, lease_s: float) -> int:
         """Runs whose process stopped updating them: marked interrupted, so a
         human can recover them. A running run writes on every budget charge,
-        so silence longer than the lease means nobody is running it."""
-        return self._exec(f"UPDATE runs SET status = 'interrupted', updated_at = ? "
+        so silence longer than the lease means it's presumably dead — and the
+        epoch bump makes sure: if it was only stalled, its next write fails."""
+        return self._exec(f"UPDATE runs SET status = 'interrupted', epoch = epoch + 1, updated_at = ? "
                           f"WHERE status IN {RUNNING} AND updated_at < ?", (now, now - lease_s)).rowcount
 
     def purge(self, before: float) -> list[str]:
         """Delete settled runs last updated before `before`. Returns their ids
         (the caller deletes their graph checkpoints too)."""
-        ids = [r["thread_id"] for r in self._exec(
-            f"SELECT thread_id FROM runs WHERE status IN {FINAL} AND updated_at < ?", (before,)).fetchall()]
+        ids = [r["thread_id"] for r in self._rows(
+            f"SELECT thread_id FROM runs WHERE status IN {FINAL} AND updated_at < ?", (before,))]
         for thread_id in ids:
             self._exec("DELETE FROM audit WHERE thread_id = ?", (thread_id,))
             self._exec("DELETE FROM runs WHERE thread_id = ?", (thread_id,))

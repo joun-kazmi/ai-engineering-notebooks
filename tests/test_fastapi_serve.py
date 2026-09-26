@@ -351,3 +351,161 @@ def test_simulated_backend_round_trips_its_key_store():
     restored = ar.InfraSimulator.from_dict(infra.to_dict())
     again = restored.rollback("payments-api", "v2.14.3", key="k1")
     assert again["deduplicated"] is True and len(restored.effects) == 1
+
+
+# ---- recovery from every crash window, fencing, safe checkpoints
+
+def test_crash_after_the_claim_before_resume_delivers_the_stored_decision(client, db, clock, monkeypatch):
+    """The approval is claimed (decision stored, status executing) and the
+    process dies before handing it to the graph: the checkpoint is still at
+    the gate. Recovery must deliver the stored decision — not put the run
+    back to awaiting_approval with a phantom decision that every later
+    /approve would 'replay'."""
+    run = alert(client)
+
+    def crash(self, *args):
+        raise SimulatedCrash()
+
+    monkeypatch.setattr(ar.RunHandle, "resume", crash)
+    with pytest.raises(SimulatedCrash):
+        serve.service().approve(run["thread_id"], True, "alice", run["proposal"]["args_hash"])
+    monkeypatch.undo()
+
+    restart(db, clock)
+    clock.t += 301
+    assert get(client, run)["status"] == "interrupted"
+    recovered = client.post(f"/runs/{run['thread_id']}/recover").json()
+    assert recovered["status"] == "completed" and recovered["approved_by"] == "alice"
+    assert "v2.14.3 -> v2.14.2" in recovered["outcome"]
+    assert len(side_effects(client, run)) == 1
+    assert approve(client, run).json() == {**recovered, "replayed": True}
+
+
+def test_crash_after_a_rejection_claim_delivers_the_rejection(client, db, clock, monkeypatch):
+    run = alert(client)
+    monkeypatch.setattr(ar.RunHandle, "resume", lambda self, *a: (_ for _ in ()).throw(SimulatedCrash()))
+    with pytest.raises(SimulatedCrash):
+        serve.service().approve(run["thread_id"], False, "sre-lead", run["proposal"]["args_hash"])
+    monkeypatch.undo()
+    restart(db, clock)
+    clock.t += 301
+    recovered = client.post(f"/runs/{run['thread_id']}/recover").json()
+    assert recovered["status"] == "escalated" and recovered["outcome"] == "Escalated to a human: rejected by sre-lead"
+    assert not side_effects(client, run)
+
+
+def test_crash_before_the_first_checkpoint_starts_again(client, db, clock, monkeypatch):
+    """The run row exists but LangGraph never wrote a checkpoint: nothing to
+    resume (invoke(None) would raise EmptyInputError), so recovery starts
+    the run again from the stored alert."""
+    monkeypatch.setattr(ar.RunHandle, "start", lambda self: (_ for _ in ()).throw(SimulatedCrash()))
+    with pytest.raises(SimulatedCrash):
+        serve.service().alert(INC["inc01"]["alert"])
+    monkeypatch.undo()
+    [row] = serve.service().store._rows("SELECT thread_id FROM runs")
+    run = {"thread_id": row["thread_id"]}
+
+    restart(db, clock)
+    clock.t += 301
+    assert serve.service().checkpointer.get_tuple({"configurable": {"thread_id": run["thread_id"]}}) is None
+    recovered = client.post(f"/runs/{run['thread_id']}/recover").json()
+    assert recovered["status"] == "awaiting_approval"
+    assert recovered["proposal"]["args"] == {"service": "payments-api", "from_version": "v2.14.3"}
+
+
+def test_a_stalled_worker_that_wakes_up_after_recovery_is_fenced_out(client, db, clock, monkeypatch):
+    """Worker A stalls mid-write for longer than the lease. B finds the run
+    silent, marks it interrupted and recovers it to completion. Then A wakes
+    up and finishes its write: its claim was revoked, so nothing it does is
+    persisted and it stops — B's result stands."""
+    run = alert(client)
+    a_blocked, a_release = threading.Event(), threading.Event()
+    real_rollback, first = ar.InfraSimulator.rollback, {"call": True}
+
+    def rollback(self, *args):
+        if first.pop("call", False):  # worker A's attempt stalls before it commits
+            a_blocked.set()
+            a_release.wait(timeout=5)
+        return real_rollback(self, *args)
+
+    monkeypatch.setattr(ar.InfraSimulator, "rollback", rollback)
+    a_result = {}
+
+    def worker_a():
+        try:
+            serve.service().approve(run["thread_id"], True, "alice", run["proposal"]["args_hash"])
+        except serve.ServiceError as e:
+            a_result["error"] = (e.status_code, e.detail)
+
+    worker = threading.Thread(target=worker_a)
+    worker.start()
+    assert a_blocked.wait(timeout=3)
+
+    b = restart(db, clock)  # worker B, on the same database
+    clock.t += 301
+    recovered = b.recover(run["thread_id"])
+    assert recovered["status"] == "completed" and "v2.14.3 -> v2.14.2" in recovered["outcome"]
+
+    a_release.set()  # A wakes up and completes its write
+    worker.join(timeout=5)
+    assert a_result["error"][0] == 409 and "revoked" in a_result["error"][1]["error"]
+
+    final = b.get(run["thread_id"])
+    assert final["status"] == "completed"
+    assert len(final["side_effects"]) == 1 and final["side_effects"][0]["detail"] == "v2.14.3 -> v2.14.2"
+    assert [r["node"] for r in final["audit"]].count("execute") == 1  # A's write was never recorded
+    snapshot = b.checkpointer.get_tuple({"configurable": {"thread_id": run["thread_id"]}})
+    assert snapshot.checkpoint["channel_values"]["outcome"].startswith("ok: v2.14.3")  # B's, not overwritten
+
+
+def test_a_revoked_epoch_can_not_write_checkpoints(db, clock):
+    svc = restart(db, clock)
+    svc.store.create("t1", "alert", clock())
+    cp = serve.FencedCheckpointer(svc.db_path, svc.store, "t1", epoch=1)
+    config = {"configurable": {"thread_id": "t1", "checkpoint_ns": ""}}
+    from langgraph.checkpoint.base import empty_checkpoint
+    cp.put(config, empty_checkpoint(), {}, {})  # epoch 1 is current
+    assert svc.store.claim("t1", "starting", "executing", clock()) == 2  # someone else claims it
+    with pytest.raises(serve.FencedOut):
+        cp.put(config, empty_checkpoint(), {}, {})
+    with pytest.raises(serve.FencedOut):
+        cp.put_writes(config, [("x", 1)], "task")
+
+
+def test_run_state_writes_require_the_current_epoch(db, clock):
+    svc = restart(db, clock)
+    svc.store.create("t1", "alert", clock())
+    svc.store.update("t1", clock(), 1, budget={"n": 1})
+    svc.store.mark_stale(clock() + 1000, lease_s=300)  # presumed dead: epoch 2
+    for write in (lambda: svc.store.update("t1", clock(), 1, budget={"n": 2}),
+                  lambda: svc.store.append_audit("t1", 1, {"tool": "x"}),
+                  lambda: svc.store.settle("t1", 1, "interrupted", "completed", clock())):
+        with pytest.raises(serve.FencedOut):
+            write()
+    assert svc.store.get("t1")["budget"] == {"n": 1} and svc.store.audit("t1") == []
+
+
+def test_checkpoints_are_deserialized_strictly():
+    import dataclasses
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    @dataclasses.dataclass
+    class Payload:
+        cmd: str
+
+    blob = JsonPlusSerializer().dumps_typed(Payload("rm -rf /"))
+    loaded = serve.strict_serde().loads_typed(blob)
+    assert not isinstance(loaded, Payload) and loaded == {"cmd": "rm -rf /"}
+
+
+def test_runs_checkpoint_synchronously(monkeypatch):
+    seen = []
+    real_invoke = type(serve.app).invoke
+
+    def spy(self, *args, **kwargs):
+        seen.append(kwargs.get("durability"))
+        return real_invoke(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(serve.app), "invoke", spy)
+    ar.run_once(INC["inc01"], "durability-check")
+    assert seen and set(seen) == {"sync"}

@@ -33,9 +33,13 @@ in the same SQLite file, written as they change. So:
     across threads and processes exactly one request executes it;
   * a run whose process dies mid-execution is marked `interrupted` once it
     has been silent for RUN_LEASE_S (a running run writes on every budget
-    charge), and /recover replays it from its last checkpoint. A write it had
-    already made is sent again with the same idempotency key, and the backend
-    answers it as a duplicate.
+    charge), and /recover continues it from where it got to (Service.recover
+    lists the cases). A write it had already made is sent again with the
+    same idempotency key, and the backend answers it as a duplicate;
+  * every claim, recovery and stale-marking bumps the run's epoch, and every
+    write — run state, audit, graph checkpoints — requires the current one,
+    so a worker that was only stalled can't overwrite a recovered run;
+  * checkpoints are written synchronously and deserialized strictly.
 
 Tools read a demo service catalog (each service's fixtures from the first
 incident about it in data/incident_eval_set.json) and write to a simulated
@@ -51,12 +55,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from ai_engineering import agent_eval as ae
 from ai_engineering import agent_reliability as ar
 from ai_engineering.config import get_settings, make_chat_client
-from ai_engineering.run_store import RunStore
+from ai_engineering.run_store import FencedOut, RunStore
 from ai_engineering.tool_runtime import AuditLog, RunBudget, ToolExecutor
 
 # ══════════════════════════════════════════════════════════
@@ -80,15 +85,43 @@ class ServiceError(Exception):
 
 
 class StoredAuditLog(AuditLog):
-    """Audit records go to the run store as each call finishes."""
+    """Audit records go to the run store as each call finishes — only while
+    this process still holds the run (its epoch)."""
 
-    def __init__(self, store: RunStore, thread_id: str):
+    def __init__(self, store: RunStore, thread_id: str, epoch: int):
         super().__init__()
-        self.store, self.thread_id = store, thread_id
+        self.store, self.thread_id, self.epoch = store, thread_id, epoch
 
     def append(self, record) -> None:
         super().append(record)
-        self.store.append_audit(self.thread_id, record.to_dict())
+        self.store.append_audit(self.thread_id, self.epoch, record.to_dict())
+
+
+def strict_serde() -> JsonPlusSerializer:
+    """Checkpoint (de)serialization limited to LangGraph's safe built-in
+    types: a tampered checkpoint database can't make the service construct
+    arbitrary Python objects. Run state here is plain JSON-like data."""
+    return JsonPlusSerializer(allowed_msgpack_modules=None)
+
+
+class FencedCheckpointer(SqliteSaver):
+    """One run's checkpoint writes, allowed only while its epoch is current.
+    Fencing the run store alone isn't enough: a stalled worker that wakes up
+    after its run was recovered elsewhere would otherwise still write graph
+    checkpoints over the recovered run's. (Check-then-write, so a write that
+    races the revocation itself can land; everything after it can't.)"""
+
+    def __init__(self, db_path: str, store: RunStore, thread_id: str, epoch: int):
+        super().__init__(sqlite3.connect(db_path, check_same_thread=False), serde=strict_serde())
+        self._fence = lambda: store.check_epoch(thread_id, epoch)
+
+    def put(self, *args, **kwargs):
+        self._fence()
+        return super().put(*args, **kwargs)
+
+    def put_writes(self, *args, **kwargs):
+        self._fence()
+        return super().put_writes(*args, **kwargs)
 
 
 # ══════════════════════════════════════════════════════════
@@ -100,42 +133,47 @@ class Service:
 
     def __init__(self, db_path: str | Path, approval_ttl_s: float, retention_s: float, lease_s: float,
                  clock=time.time):
+        self.db_path = str(db_path)
         self.store = RunStore(db_path)
-        self.checkpointer = SqliteSaver(sqlite3.connect(str(db_path), check_same_thread=False))
+        # For reading checkpoints and deleting purged ones; runs write through
+        # their own FencedCheckpointer.
+        self.checkpointer = SqliteSaver(sqlite3.connect(self.db_path, check_same_thread=False), serde=strict_serde())
         self.checkpointer.setup()
         self.approval_ttl_s, self.retention_s, self.lease_s = approval_ttl_s, retention_s, lease_s
         self.clock = clock
 
     # ---- building a run, new or from the store
 
-    def _open(self, thread_id: str, alert: str, row: dict | None = None) -> ar.RunHandle:
-        """A RunHandle whose state is written to the store as it changes. With
-        `row`, it continues a stored run: budget, ledger, breaker, backend and
-        graph checkpoint as they were."""
+    def _open(self, thread_id: str, alert: str, epoch: int, row: dict | None = None) -> ar.RunHandle:
+        """A RunHandle whose state is written to the store as it changes,
+        every write fenced by `epoch`. With `row`, it continues a stored run:
+        budget, ledger, breaker, backend and graph checkpoint as they were."""
         settings = get_settings()
         infra = (ar.InfraSimulator.from_dict(row["infra"]) if row and row["infra"]
                  else ar.InfraSimulator.for_catalog(CATALOG))
         budget = (RunBudget.from_dict(row["budget"], LIMITS, settings.llm_usd_per_mtok_in,
                                       settings.llm_usd_per_mtok_out) if row and row["budget"] else None)
         run = ar.RunHandle(alert, thread_id, ar.catalog_registry(CATALOG, infra, ar.Scenario()), infra,
-                           audit=StoredAuditLog(self.store, thread_id), checkpointer=self.checkpointer,
+                           audit=StoredAuditLog(self.store, thread_id, epoch),
+                           checkpointer=FencedCheckpointer(self.db_path, self.store, thread_id, epoch),
                            budget=budget, executor_state=row["executor"] if row else None)
-        infra.on_change = lambda i: self.store.update(thread_id, self.clock(), infra=i.to_dict())
-        run.budget.on_change = lambda b: self.store.update(thread_id, self.clock(), budget=b.to_dict())
-        run.executor.on_finish = lambda ex: self.store.update(thread_id, self.clock(), executor=ex.state())
-        self.store.update(thread_id, self.clock(), budget=run.budget.to_dict(), infra=infra.to_dict())
+        infra.on_change = lambda i: self.store.update(thread_id, self.clock(), epoch, infra=i.to_dict())
+        run.budget.on_change = lambda b: self.store.update(thread_id, self.clock(), epoch, budget=b.to_dict())
+        run.executor.on_finish = lambda ex: self.store.update(thread_id, self.clock(), epoch, executor=ex.state())
+        self.store.update(thread_id, self.clock(), epoch, budget=run.budget.to_dict(), infra=infra.to_dict())
         if row is not None:
             run.load()
         return run
 
-    def _settle(self, thread_id: str, run: ar.RunHandle, from_status: str, decision: dict | None = None) -> dict:
+    def _settle(self, thread_id: str, run: ar.RunHandle, epoch: int, from_status: str,
+                decision: dict | None = None) -> dict:
         """Record where the run stopped: at the gate, or finished."""
         now = self.clock()
         proposal = run.pending_proposal
         if proposal is not None:
-            self.store.transition(thread_id, from_status, "awaiting_approval", now, proposal=proposal,
-                                  root_cause=(run.state.get("report") or {}).get("root_cause"),
-                                  expires_at=now + self.approval_ttl_s)
+            self.store.settle(thread_id, epoch, from_status, "awaiting_approval", now, proposal=proposal,
+                              root_cause=(run.state.get("report") or {}).get("root_cause"),
+                              expires_at=now + self.approval_ttl_s)
         else:
             state = run.state
             rejected = state.get("approval", {}).get("approved") is False
@@ -144,7 +182,7 @@ class Service:
                         "halted": state.get("halted")}
             if decision is not None:
                 response["approved_by"] = decision["approver"] if decision["approved"] else None
-            self.store.transition(thread_id, from_status, status, now, response=response)
+            self.store.settle(thread_id, epoch, from_status, status, now, response=response)
         return self.summary(self.store.get(thread_id))
 
     # ---- housekeeping
@@ -180,13 +218,22 @@ class Service:
 
     # ---- the API
 
+    @staticmethod
+    def _taken_over(thread_id: str) -> ServiceError:
+        return ServiceError(409, {"error": "This process's claim on the run was revoked (it was presumed dead and "
+                                           "the run marked interrupted or recovered elsewhere)",
+                                  "thread_id": thread_id})
+
     def alert(self, alert_text: str) -> dict:
         self.housekeeping()
         thread_id = str(uuid.uuid4())
-        self.store.create(thread_id, alert_text, self.clock())
-        run = self._open(thread_id, alert_text)
-        run.start()
-        return self._settle(thread_id, run, "starting")
+        self.store.create(thread_id, alert_text, self.clock())  # epoch 1
+        try:
+            run = self._open(thread_id, alert_text, epoch=1)
+            run.start()
+            return self._settle(thread_id, run, 1, "starting")
+        except FencedOut:
+            raise self._taken_over(thread_id) from None
 
     def approve(self, thread_id: str, approved: bool, approver: str, args_hash: str) -> dict:
         row = self._row(thread_id)
@@ -213,23 +260,52 @@ class Service:
 
         # Claim it. Across threads and processes, exactly one request wins; a
         # loser re-reads the row and gets the replay/409 answer above.
-        if not self.store.transition(thread_id, "awaiting_approval", "executing", self.clock(), decision=decision):
+        epoch = self.store.claim(thread_id, "awaiting_approval", "executing", self.clock(), decision=decision)
+        if epoch is None:
             return self.approve(thread_id, approved, approver, args_hash)
-        run = self._open(thread_id, row["alert"], self.store.get(thread_id))
-        run.resume(approved, approver)
-        return {**self._settle(thread_id, run, "executing", decision), "replayed": False}
+        try:
+            run = self._open(thread_id, row["alert"], epoch, self.store.get(thread_id))
+            run.resume(approved, approver)
+            return {**self._settle(thread_id, run, epoch, "executing", decision), "replayed": False}
+        except FencedOut:
+            raise self._taken_over(thread_id) from None
 
     def recover(self, thread_id: str) -> dict:
+        """Continue an interrupted run. Where to continue from depends on how
+        far it got before its process died, which the stored decision and
+        the graph checkpoint tell together:
+
+          no checkpoint at all        crashed before LangGraph's first write:
+                                      start again from the stored alert
+          paused at the gate, decided crashed after the approval was claimed
+                                      but before it was delivered: deliver
+                                      the stored decision
+          paused at the gate, no decision   it had reached the gate: back to
+                                      awaiting_approval
+          anywhere else               continue from the last checkpoint; a
+                                      write it had made is re-sent with the
+                                      same idempotency key and deduplicated
+        """
         row = self._row(thread_id)
         if row["status"] != "interrupted":
             raise ServiceError(409, f"Only an interrupted run can be recovered; this one is {row['status']}")
         resuming = "executing" if row["decision"] else "starting"
-        if not self.store.transition(thread_id, "interrupted", resuming, self.clock()):
+        epoch = self.store.claim(thread_id, "interrupted", resuming, self.clock())
+        if epoch is None:
             raise ServiceError(409, "Another request is already recovering this run")
-        run = self._open(thread_id, row["alert"], self.store.get(thread_id))
-        if run.pending_proposal is None:  # not already back at the gate: continue from the last checkpoint
-            run.recover()
-        return self._settle(thread_id, run, resuming, row["decision"])
+        decision = row["decision"]
+        try:
+            run = self._open(thread_id, row["alert"], epoch, self.store.get(thread_id))
+            if self.checkpointer.get_tuple(run.config) is None:
+                run.start()
+            elif run.pending_proposal is not None:
+                if decision is not None:
+                    run.resume(decision["approved"], decision["approver"])
+            else:
+                run.recover()
+            return self._settle(thread_id, run, epoch, resuming, decision)
+        except FencedOut:
+            raise self._taken_over(thread_id) from None
 
     def get(self, thread_id: str) -> dict:
         row = self._row(thread_id)

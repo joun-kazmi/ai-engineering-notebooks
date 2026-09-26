@@ -867,6 +867,10 @@ class RunHandle:
         self.app = build_graph(self.scenario, self.budget, self.executor, observations={}, llm=self.llm,
                                checkpointer=checkpointer)
         # Graph steps are budgeted, so recursion_limit is only a backstop.
+        # Every invoke uses durability="sync": each step's checkpoint is written
+        # before the next step starts (LangGraph's default, "async", writes it
+        # in the background, so a crash can lose the latest one and recovery
+        # would re-run a step that had already finished).
         self.config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
         self.state: dict = {}
 
@@ -891,13 +895,14 @@ class RunHandle:
         checkpoint. The node that was running re-runs from the start, so a
         write it had already made is sent again with the same idempotency
         key, and the backend answers it as a duplicate instead of acting."""
-        self.state = self.app.invoke(None, self.config)
+        self.state = self.app.invoke(None, self.config, durability="sync")
         if self.pending_proposal is None:
             self._finish()
         return self.state
 
     def start(self) -> dict:
-        self.state = self.app.invoke({"alert": self.alert, "attempts": 0, "evidence": []}, self.config)
+        self.state = self.app.invoke({"alert": self.alert, "attempts": 0, "evidence": []}, self.config,
+                                     durability="sync")
         if self.pending_proposal is None:
             self._finish()
         return self.state
@@ -905,7 +910,8 @@ class RunHandle:
     def resume(self, approved: bool, approver: str) -> dict:
         if self.pending_proposal is None:
             raise RuntimeError(f"run {self.thread_id} is not waiting for approval")
-        self.state = self.app.invoke(Command(resume={"approved": approved, "approver": approver}), self.config)
+        self.state = self.app.invoke(Command(resume={"approved": approved, "approver": approver}), self.config,
+                                     durability="sync")
         self._finish()
         return self.state
 
