@@ -278,18 +278,43 @@ for label, honor, retry in [("keyed, backend dedupes", True, True),
 # 
 # ## 6. The audit record
 # 
-# Every call produces one `AuditRecord`, including denied and invalid ones. It holds the tool, permission, validated arguments, idempotency key, the full approval, the outcome, the error class, latency, attempts and retry count. `AuditLog(path)` also appends each record as a JSON line when the call finishes, so a crash doesn't lose the calls that led up to it:
+# Every call produces one `AuditRecord`, including denied and invalid ones. It holds the tool, permission, validated arguments, idempotency key, the full approval, the outcome, the error class, latency, attempts and retry count. `AuditLog(path)` also appends each record as a JSON line when the call finishes, so a crash doesn't lose the calls that led up to it.
+# 
+# This section is about the record itself, so it drives the executor directly: a read that gets a 503 and is retried, a write attempted from a read step, and an approved write that commits and then loses its response. What the agent does end to end is covered in section 7.
 
 # In[13]:
 
 
 path = Path(tempfile.mkdtemp()) / "audit.jsonl"
-r = ar.run_once(INC["inc05"], "demo-audit", ar.Scenario(faults={"restart_service": ar.Fault(transient_failures=1)}),
-                approve=lambda p: (True, "alice"), audit=AuditLog(path))
-print("outcome:", r.outcome)
-lines = path.read_text().splitlines()
-print(f"{len(lines)} JSONL records; the write:")
-print(json.dumps(json.loads(lines[-1]), indent=1))
+inc = INC["inc05"]
+scenario = ar.Scenario(write_timeout_s=0.5, faults={
+    "get_metrics": ar.Fault(transient_failures=1),                                  # one 503, then fine
+    "restart_service": ar.Fault(slow_calls=1, delay_s=1.0, after_commit=True),     # commits, response lost
+})
+registry = ar.build_registry(inc, ar.InfraSimulator(inc), scenario)
+audit_ex = ToolExecutor(registry, "demo-audit", audit=AuditLog(path))
+reads = audit_ex.with_registry(registry.scoped(Permission.READ))
+writes = audit_ex.with_registry(registry.scoped(Permission.WRITE))
+
+restart = {"service": "notifications-service", "replica": "worker-3"}
+reads.call("get_metrics", {"service": "notifications-service"}, node="investigate")
+reads.call("restart_service", restart, node="investigate")               # a write from a read step
+approval = decide(propose(writes.registry, "demo-audit", "restart_service", restart), "alice", True)
+writes.call("restart_service", restart, node="execute", approval=approval)
+time.sleep(1.1)  # let the timed-out first attempt finish in the background
+
+rows = [json.loads(line) for line in path.read_text().splitlines()]
+print(f"{len(rows)} JSONL records:")
+for row in rows:
+    print(f"  {row['node']:11s} {row['tool']:16s} {row['permission']:5s} {row['outcome']:13s} "
+          f"attempts={row['attempts']} retry_count={row['retry_count']}")
+executed = [row for row in rows if row["permission"] == "write" and row["outcome"] in ("ok", "deduplicated")]
+print()
+if executed:
+    print("the approved write, in full:")
+    print(json.dumps(executed[-1], indent=1))
+else:
+    print("No write took effect.")
 
 
 # ## 7. The incident set, under faults
