@@ -49,6 +49,7 @@ import sqlite3
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -108,20 +109,47 @@ class FencedCheckpointer(SqliteSaver):
     """One run's checkpoint writes, allowed only while its epoch is current.
     Fencing the run store alone isn't enough: a stalled worker that wakes up
     after its run was recovered elsewhere would otherwise still write graph
-    checkpoints over the recovered run's. (Check-then-write, so a write that
-    races the revocation itself can land; everything after it can't.)"""
+    checkpoints over the recovered run's.
+
+    The epoch check and the write are one SQLite transaction. Every write
+    SqliteSaver makes (put, put_writes, delete_thread) goes through
+    `cursor(transaction=True)`; here that starts with BEGIN IMMEDIATE, which
+    takes the database's write lock, then reads the epoch, then lets the
+    write run and commits. SQLite admits one writer at a time across
+    processes, so the epoch bump that revokes this run (itself a write)
+    can't land between the check and the write — it waits for the commit,
+    and every write after it fails the check."""
 
     def __init__(self, db_path: str, store: RunStore, thread_id: str, epoch: int):
-        super().__init__(sqlite3.connect(db_path, check_same_thread=False), serde=strict_serde())
-        self._fence = lambda: store.check_epoch(thread_id, epoch)
+        # Autocommit mode: this class issues BEGIN/COMMIT itself.
+        conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None, timeout=30)
+        super().__init__(conn, serde=strict_serde())
+        self.run_thread_id, self.epoch = thread_id, epoch
 
-    def put(self, *args, **kwargs):
-        self._fence()
-        return super().put(*args, **kwargs)
+    def _check_epoch(self, cur: sqlite3.Cursor) -> None:
+        row = cur.execute("SELECT epoch FROM runs WHERE thread_id = ?", (self.run_thread_id,)).fetchone()
+        if row is None or row[0] != self.epoch:
+            raise FencedOut(f"run {self.run_thread_id}: epoch {self.epoch} is no longer current")
 
-    def put_writes(self, *args, **kwargs):
-        self._fence()
-        return super().put_writes(*args, **kwargs)
+    @contextmanager
+    def cursor(self, transaction: bool = True):
+        if not transaction:  # reads aren't fenced
+            with super().cursor(transaction=False) as cur:
+                yield cur
+            return
+        with self.lock:
+            self.setup()
+            cur = self.conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                self._check_epoch(cur)
+                yield cur
+                cur.execute("COMMIT")
+            except BaseException:
+                cur.execute("ROLLBACK")
+                raise
+            finally:
+                cur.close()
 
 
 # ══════════════════════════════════════════════════════════

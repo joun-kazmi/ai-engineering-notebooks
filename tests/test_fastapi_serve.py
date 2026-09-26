@@ -509,3 +509,52 @@ def test_runs_checkpoint_synchronously(monkeypatch):
     monkeypatch.setattr(type(serve.app), "invoke", spy)
     ar.run_once(INC["inc01"], "durability-check")
     assert seen and set(seen) == {"sync"}
+
+
+def test_checkpoint_fence_check_and_write_are_one_transaction(db, clock, monkeypatch):
+    """Worker A passes the epoch check and stalls before writing. Worker B —
+    its own connection, as another process would have — tries to revoke A's
+    claim right then. B must wait until A's write commits: the revocation
+    can't land between A's check and A's write. After it lands, A can't
+    write anything."""
+    from langgraph.checkpoint.base import empty_checkpoint
+    from ai_engineering.run_store import RunStore
+
+    svc = restart(db, clock)
+    svc.store.create("t1", "alert", clock())
+    other_process = RunStore(db)
+    cp = serve.FencedCheckpointer(svc.db_path, svc.store, "t1", epoch=1)
+    config = {"configurable": {"thread_id": "t1", "checkpoint_ns": ""}}
+
+    checked, release = threading.Event(), threading.Event()
+    real_check = serve.FencedCheckpointer._check_epoch
+
+    def check_then_stall(self, cur):
+        real_check(self, cur)  # epoch 1 is current...
+        checked.set()
+        release.wait(timeout=5)  # ...and A stalls between the check and the write
+
+    monkeypatch.setattr(serve.FencedCheckpointer, "_check_epoch", check_then_stall)
+    worker_a = threading.Thread(target=lambda: cp.put(config, empty_checkpoint(), {}, {}))
+    worker_a.start()
+    assert checked.wait(timeout=3)
+
+    revoked = {}
+    worker_b = threading.Thread(target=lambda: revoked.update(
+        epoch=other_process.claim("t1", "starting", "executing", clock())))
+    worker_b.start()
+    worker_b.join(timeout=0.5)
+    assert worker_b.is_alive(), "the revocation landed between A's epoch check and A's write"
+
+    release.set()
+    worker_a.join(timeout=3)
+    worker_b.join(timeout=5)
+    assert revoked["epoch"] == 2
+    assert svc.checkpointer.get_tuple({"configurable": {"thread_id": "t1"}}) is not None  # A's write, made in time
+
+    monkeypatch.setattr(serve.FencedCheckpointer, "_check_epoch", real_check)
+    with pytest.raises(serve.FencedOut):
+        cp.put(config, empty_checkpoint(), {}, {})
+    with pytest.raises(serve.FencedOut):
+        cp.put_writes(config, [("x", 1)], "task")
+    assert len(list(svc.checkpointer.list({"configurable": {"thread_id": "t1"}}))) == 1  # nothing after it
