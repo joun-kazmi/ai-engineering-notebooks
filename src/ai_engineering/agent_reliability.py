@@ -183,7 +183,8 @@ def _previous_version(version: str) -> str:
 
 
 class InfraSimulator:
-    """In-memory deploy system, pager and orchestrator for one incident.
+    """In-memory deploy system, pager and orchestrator — for one incident, or
+    (`for_catalog`) for every service in a catalog, as the served agent uses.
 
     Like a payments API, it honors idempotency keys: a request with a key it
     has already completed returns the stored result, flagged
@@ -191,15 +192,19 @@ class InfraSimulator:
     backend that doesn't, so a retried write acts twice. Side effects are
     listed in `effects`, so double-actions are visible as data."""
 
-    def __init__(self, incident: dict, honor_keys: bool = True):
+    def __init__(self, incident: dict | None = None, honor_keys: bool = True, deployed: dict[str, str] | None = None):
         self.honor_keys = honor_keys
-        self.deployed: dict[str, str] = {}
-        deploys = incident["fixtures"]["deploys"]
-        if deploys:
-            self.deployed[incident["service"]] = deploys[0]["version"]
+        self.deployed: dict[str, str] = dict(deployed or {})
+        if incident is not None and incident["fixtures"]["deploys"]:
+            self.deployed[incident["service"]] = incident["fixtures"]["deploys"][0]["version"]
         self.effects: list[dict] = []
         self._keys: dict[str, dict] = {}
         self._lock = threading.Lock()
+
+    @classmethod
+    def for_catalog(cls, catalog: dict[str, dict], honor_keys: bool = True) -> "InfraSimulator":
+        return cls(honor_keys=honor_keys, deployed={svc: fx["deploys"][0]["version"]
+                                                    for svc, fx in catalog.items() if fx["deploys"]})
 
     def _once(self, key: str | None, apply: Callable[[], dict]) -> dict:
         with self._lock:
@@ -296,15 +301,46 @@ class _Faults:
 
 
 def build_registry(incident: dict, infra: InfraSimulator, scenario: Scenario) -> ToolRegistry:
-    """The agent's tools, bound to one incident's fixtures and one simulator."""
+    """The agent's tools, bound to one incident's fixtures and one simulator.
+    A service other than the incident's gets agent_eval's decoy evidence, as
+    in the observability eval's broken run."""
+    return registry_for(lambda service: ae._fixtures_for(service, incident), infra, scenario,
+                        injected_for=incident["service"])
+
+
+def catalog_from_incidents(incidents: list[dict]) -> dict[str, dict]:
+    """A demo service catalog: each service's fixtures from its first incident."""
+    catalog: dict[str, dict] = {}
+    for inc in incidents:
+        catalog.setdefault(inc["service"], inc["fixtures"])
+    return catalog
+
+
+def catalog_registry(catalog: dict[str, dict], infra: InfraSimulator, scenario: Scenario) -> ToolRegistry:
+    """Tools over a service catalog, for alerts about any service in it. An
+    unknown service is a 404 from the backend: not retried, and without
+    evidence the run escalates."""
+    def fixtures_for(service: str) -> dict:
+        for name, fixtures in catalog.items():
+            if ae._norm(name) == ae._norm(service):
+                return fixtures
+        raise BackendError(404, f"no service named {service!r} in the catalog")
+    return registry_for(fixtures_for, infra, scenario)
+
+
+def registry_for(fixtures_for: Callable[[str], dict], infra: InfraSimulator, scenario: Scenario,
+                 injected_for: str | None = None) -> ToolRegistry:
+    """The agent's tools: reads served from `fixtures_for(service)`, writes
+    against `infra`. `scenario.injected_log` is appended to `search_logs`
+    results for the service `injected_for`."""
     faults = _Faults(scenario.faults)
 
     def fixture_tool(impl):
         def fn(args, ctx):
             params = args.model_dump()
-            out = impl(ae._fixtures_for(params["service"], incident), **params)
-            if impl is ae._tool_search_logs and scenario.injected_log and \
-                    ae._norm(params["service"]) == ae._norm(incident["service"]):
+            out = impl(fixtures_for(params["service"]), **params)
+            if impl is ae._tool_search_logs and scenario.injected_log and injected_for and \
+                    ae._norm(params["service"]) == ae._norm(injected_for):
                 out = {**out, "matches": out["matches"] + [scenario.injected_log]}
             return out
         return fn
@@ -539,7 +575,7 @@ LIVE_SYSTEM = ("You investigate production incidents. Use your tools to gather e
                "Only state what the tool results show.")
 
 
-def build_graph(incident: dict, scenario: Scenario, budget: RunBudget, executor: ToolExecutor,
+def build_graph(scenario: Scenario, budget: RunBudget, executor: ToolExecutor,
                 observations: dict, llm: BudgetedChatClient | None = None):
     """`observations` collects the latest successful output of each read
     tool, for the OFFLINE RCA and the pre-gate checks. `llm` is required in
@@ -778,47 +814,84 @@ def _auto_approve(proposal: dict) -> tuple[bool, str]:
     return True, "eval-harness"
 
 
+class RunHandle:
+    """One run of the hardened graph, split at the approval gate so the two
+    halves can happen in different requests (the served agent):
+    `start()` runs until the gate or the end; `resume()` delivers the human's
+    decision. Everything the run owns — graph, budget, executor with its
+    audit log and idempotency ledger, simulator — lives here, in memory."""
+
+    def __init__(self, alert: str, thread_id: str, registry: ToolRegistry, infra: InfraSimulator,
+                 scenario: Scenario | None = None, audit: AuditLog | None = None,
+                 sleep: Callable[[float], None] = time.sleep):
+        self.alert, self.thread_id, self.infra = alert, thread_id, infra
+        self.scenario = scenario or Scenario()
+        self.budget = RunBudget(self.scenario.limits, settings.llm_usd_per_mtok_in, settings.llm_usd_per_mtok_out)
+        self.executor = ToolExecutor(registry, thread_id, self.budget,
+                                     audit if audit is not None else AuditLog(), sleep=sleep)
+        self.llm = None if OFFLINE else BudgetedChatClient(_hardened_client(), self.budget)
+        self.app = build_graph(self.scenario, self.budget, self.executor, observations={}, llm=self.llm)
+        # Graph steps are budgeted, so recursion_limit is only a backstop.
+        self.config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
+        self.state: dict = {}
+
+    @property
+    def pending_proposal(self) -> dict | None:
+        """The proposal waiting at the approval gate, if the run is paused there."""
+        interrupts = self.state.get("__interrupt__")
+        return interrupts[0].value["proposal"] if interrupts else None
+
+    def start(self) -> dict:
+        self.state = self.app.invoke({"alert": self.alert, "attempts": 0, "evidence": []}, self.config)
+        if self.pending_proposal is None:
+            self._finish()
+        return self.state
+
+    def resume(self, approved: bool, approver: str) -> dict:
+        if self.pending_proposal is None:
+            raise RuntimeError(f"run {self.thread_id} is not waiting for approval")
+        self.state = self.app.invoke(Command(resume={"approved": approved, "approver": approver}), self.config)
+        self._finish()
+        return self.state
+
+    def _finish(self) -> None:
+        self.budget.suspend()  # the run is over: freeze elapsed_s for reporting
+        for status, n in (self.llm.retried if self.llm else {}).items():
+            TRANSIENT_ERRORS[status] = TRANSIENT_ERRORS.get(status, 0) + n
+
+
 def run_once(incident: dict, thread_id: str, scenario: Scenario | None = None,
              approve: Callable[[dict], tuple[bool, str]] = _auto_approve,
              audit: AuditLog | None = None, sleep: Callable[[float], None] = time.sleep) -> HardenedRun:
     """Runs one incident to completion. `approve(proposal) -> (approved,
     approver)` stands in for the human at the gate; the default approves."""
     scenario = scenario or Scenario()
-    budget = RunBudget(scenario.limits, settings.llm_usd_per_mtok_in, settings.llm_usd_per_mtok_out)
     infra = InfraSimulator(incident, honor_keys=scenario.backend_honors_keys)
-    executor = ToolExecutor(build_registry(incident, infra, scenario), thread_id, budget,
-                            audit if audit is not None else AuditLog(), sleep=sleep)
-    llm = None if OFFLINE else BudgetedChatClient(_hardened_client(), budget)
-    app = build_graph(incident, scenario, budget, executor, observations={}, llm=llm)
-    # Graph steps are budgeted, so recursion_limit is only a backstop.
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
+    run = RunHandle(incident["alert"], thread_id, build_registry(incident, infra, scenario), infra, scenario,
+                    audit, sleep)
 
     def invoke():
-        state = app.invoke({"alert": incident["alert"], "attempts": 0, "evidence": []}, config)
-        if state.get("__interrupt__"):
-            approved, approver = approve(state["__interrupt__"][0].value["proposal"])
-            state = app.invoke(Command(resume={"approved": approved, "approver": approver}), config)
-        budget.suspend()  # the run is over: freeze elapsed_s for reporting
-        for status, n in (llm.retried if llm else {}).items():
-            TRANSIENT_ERRORS[status] = TRANSIENT_ERRORS.get(status, 0) + n
-        return state
+        run.start()
+        if run.pending_proposal is not None:
+            run.resume(*approve(run.pending_proposal))
+        return run.state
 
     lf = ae.langfuse_client()
     if lf is None:
-        return HardenedRun(incident["id"], invoke(), budget, executor.audit, infra)
+        return HardenedRun(incident["id"], invoke(), run.budget, run.executor.audit, infra)
 
     from langfuse.langchain import CallbackHandler
 
-    config["callbacks"] = [CallbackHandler()]
+    run.config["callbacks"] = [CallbackHandler()]
     with lf.start_as_current_observation(name=f"hardened:{thread_id}", as_type="span") as root:
         state = invoke()
         trace_id = lf.get_current_trace_id()
         root.update(input={"alert": incident["alert"]},
                     output={"outcome": state.get("outcome"), "halted": state.get("halted")},
                     metadata={"incident_id": incident["id"], "mode": "offline" if OFFLINE else "live",
-                              "budget": budget.snapshot(),
-                              "audit": [r.to_dict() for r in executor.audit.records]})
-    return HardenedRun(incident["id"], state, budget, executor.audit, infra, trace_id)
+                              "budget": run.budget.snapshot(),
+                              "audit": [r.to_dict() for r in run.executor.audit.records]})
+    return HardenedRun(incident["id"], state, run.budget, run.executor.audit, infra, trace_id)
 
 
 # ========== INVARIANTS ==========

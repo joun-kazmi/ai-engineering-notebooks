@@ -1,8 +1,8 @@
 """A hardened runtime for agent tool calls.
 
 Generic, no incident-specific code: the hardened escalation agent in
-agent_reliability.py is built on it, and src/fastapi_serve.py can move onto
-it without dragging the eval harness along. Every tool call an agent makes
+agent_reliability.py is built on it, and src/fastapi_serve.py serves that
+agent. Every tool call an agent makes
 goes through `ToolExecutor.call()`, which applies, in order:
 
   1. Scope: the node's registry view decides which tools exist for it. A
