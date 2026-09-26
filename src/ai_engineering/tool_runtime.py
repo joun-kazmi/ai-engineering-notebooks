@@ -36,6 +36,7 @@ marked `idempotent` — its backend honors the idempotency key and replays the
 stored result for a repeated key instead of acting twice. A non-idempotent
 write that times out is reported as `timeout` and left for a human.
 """
+import contextvars
 import hashlib
 import json
 import time
@@ -129,6 +130,14 @@ def is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, (openai.APIConnectionError, openai.APITimeoutError))
 
 
+def is_retryable_write(exc: BaseException) -> bool:
+    """is_retryable, except a 409 Conflict. From a write API a 409 usually
+    means the request conflicts with the current state (a concurrent change,
+    a duplicate), which another attempt won't fix — unlike an LLM endpoint's
+    409, which is congestion. The default for WRITE tools."""
+    return getattr(exc, "status_code", None) != 409 and is_retryable(exc)
+
+
 # ========== CONTRACTS: specs, registry, schemas ==========
 
 @dataclass(frozen=True)
@@ -158,6 +167,9 @@ class ToolSpec:
     `idempotent` asserts the backend honors `ctx.idempotency_key`: a repeated
     key returns the stored result without acting again, flagged as
     `deduplicated=True` in the output. Only then is a write safe to retry.
+
+    `retryable` overrides the error classification for this tool; the
+    default is is_retryable for READ tools and is_retryable_write for WRITE.
     """
     name: str
     description: str
@@ -168,6 +180,12 @@ class ToolSpec:
     timeout_s: float = 5.0
     retry: RetryPolicy = RetryPolicy()
     idempotent: bool = False
+    retryable: Callable[[BaseException], bool] | None = None
+
+    def classify(self, exc: BaseException) -> bool:
+        if self.retryable is not None:
+            return self.retryable(exc)
+        return (is_retryable_write if self.permission is Permission.WRITE else is_retryable)(exc)
 
     def openai_schema(self) -> dict:
         """The function-calling schema, generated from the input model — the
@@ -389,6 +407,20 @@ class RunBudget:
         self._check("graph_steps", self.graph_steps + 1, self.limits.max_graph_steps)
         self.graph_steps += 1
 
+    def overruns(self, time_grace_s: float = 1.0) -> list[str]:
+        """Limits the run's *final* usage is over, checked directly rather than
+        trusting `exceeded` (which is only set when a later charge notices).
+        Tokens and cost are excluded: they're only known after a call returns,
+        so overshooting them by one call's usage is by design. `time_grace_s`
+        allows for scheduling slack around an attempt's deadline."""
+        lim = self.limits
+        checks = [("llm_calls", self.llm_calls, lim.max_llm_calls), ("tool_calls", self.tool_calls, lim.max_tool_calls),
+                  ("graph_steps", self.graph_steps, lim.max_graph_steps)]
+        over = [name for name, used, cap in checks if cap is not None and used > cap]
+        if lim.max_seconds is not None and self.elapsed_s > lim.max_seconds + time_grace_s:
+            over.append("time_s")
+        return over
+
     def snapshot(self) -> dict:
         lim = self.limits
         cost = self.cost_usd
@@ -403,31 +435,90 @@ class RunBudget:
         }
 
 
+class LLMUnavailable(ToolError):
+    """Retryable LLM errors outlasted the retry policy. Deliberately *not* an
+    OpenAI error type, so an outer retry wrapper keyed on those types doesn't
+    start the whole cycle again."""
+    outcome = "failed"
+
+
 class BudgetedChatClient:
-    """Wraps an OpenAI-compatible client so every chat completion — retries
-    included, since each is a real request — is charged to the budget first
-    and its token usage recorded after. Duck-types `client.chat.completions.create`.
+    """An OpenAI-compatible chat client whose every HTTP attempt is charged to
+    the run budget and bounded by it. Duck-types `client.chat.completions.create`.
 
-    Each request also gets a timeout of at most `call_timeout_s` and never
-    more than the run's remaining time. Checking the time budget only
-    *between* calls doesn't bound a call that's already stuck: with the
-    SDK's own retries on top, one stalled connection could otherwise hold a
-    run for many times its `max_seconds`."""
+    Wrap a client built with `max_retries=0`: this class owns the retries, so
+    each attempt is a charged LLM call and none happen out of sight. Per
+    attempt:
 
-    def __init__(self, client, budget: RunBudget, call_timeout_s: float = 60.0):
+      * the budget is charged first (LLM calls, and the time/tokens/cost
+        already spent), raising BudgetExceeded when a limit is reached;
+      * the timeout is min(call_timeout_s, time left in the run) and is set
+        after the caller's kwargs, so a caller can't widen it;
+      * the attempt runs on a worker thread and is abandoned at that
+        deadline. httpx timeouts are per network operation, not per request,
+        so they alone don't bound wall time.
+
+    Retryable failures (is_retryable) back off with jitter, but never sleep
+    past the run's deadline: that raises BudgetExceeded instead. The default
+    policy (10 attempts, backoff capped at 60 s) can wait out several minutes
+    of a congested endpoint, so the run's time budget, not the attempt count,
+    is what usually ends it. Retries that
+    run out raise LLMUnavailable. `retried` counts retried errors by HTTP
+    status ("429", "503", "timeout", "connection")."""
+
+    def __init__(self, client, budget: RunBudget, call_timeout_s: float = 60.0,
+                 retry: RetryPolicy = RetryPolicy(max_attempts=10, initial_s=2.0, max_s=60.0, jitter_s=2.0),
+                 sleep: Callable[[float], None] = time.sleep):
         self._client = client
         self.budget = budget
         self.call_timeout_s = call_timeout_s
+        self.retry = retry
+        self.retried: dict[str, int] = {}
+        self._sleep = sleep
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
-    def _create(self, **kwargs):
+    def _deadline_exceeded(self, extra_s: float = 0.0) -> BudgetExceeded:
+        self.budget.exceeded = self.budget.exceeded or "time_s"
+        return BudgetExceeded("time_s", round(self.budget.elapsed_s + extra_s, 1), self.budget.limits.max_seconds)
+
+    def _attempt(self, kwargs: dict):
         self.budget.charge_llm_call()
         remaining = self.budget.remaining_s()
-        timeout = self.call_timeout_s if remaining is None else max(1.0, min(self.call_timeout_s, remaining))
-        resp = self._client.chat.completions.create(**{"timeout": timeout, **kwargs})
-        if getattr(resp, "usage", None):
-            self.budget.record_usage(resp.usage.prompt_tokens, resp.usage.completion_tokens)
-        return resp
+        timeout = self.call_timeout_s if remaining is None else min(self.call_timeout_s, remaining)
+        if timeout <= 0:
+            raise self._deadline_exceeded()
+        # copy_context: tracing (Langfuse/OpenTelemetry) keeps its parent span on the worker thread.
+        future = _LLM_POOL.submit(contextvars.copy_context().run, self._client.chat.completions.create,
+                                  **{**kwargs, "timeout": timeout})
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeout:
+            raise ToolTimeout(f"LLM call did not return within {timeout:.2g}s") from None
+
+    def _create(self, **kwargs):
+        wait = wait_exponential_jitter(initial=self.retry.initial_s, max=self.retry.max_s, jitter=self.retry.jitter_s)
+        for attempt in range(1, self.retry.max_attempts + 1):
+            try:
+                resp = self._attempt(kwargs)
+            except BudgetExceeded:
+                raise
+            except Exception as e:
+                if not is_retryable(e):
+                    raise
+                timed_out = isinstance(e, (TimeoutError, ToolTimeout)) or "Timeout" in type(e).__name__
+                key = str(getattr(e, "status_code", None) or ("timeout" if timed_out else "connection"))
+                self.retried[key] = self.retried.get(key, 0) + 1
+                if attempt == self.retry.max_attempts:
+                    raise LLMUnavailable(f"{type(e).__name__} after {attempt} attempts: {str(e)[:200]}") from e
+                delay = wait(SimpleNamespace(attempt_number=attempt))
+                remaining = self.budget.remaining_s()
+                if remaining is not None and delay >= remaining:
+                    raise self._deadline_exceeded(delay) from e
+                self._sleep(delay)
+                continue
+            if getattr(resp, "usage", None):
+                self.budget.record_usage(resp.usage.prompt_tokens, resp.usage.completion_tokens)
+            return resp
 
 
 # ========== AUDIT ==========
@@ -503,9 +594,14 @@ class ToolResult:
         return self.output if self.ok else {"error": self.error}
 
 
-# Shared worker pool for timeouts. A timed-out attempt can't be killed and
-# keeps its worker until it returns; the pool is sized for a few of those.
+# Worker pools for timeouts. A timed-out attempt can't be killed and keeps
+# its worker until it returns. That's fine for a notebook or a batch eval,
+# where a stuck call eventually hits its own network timeout. In a
+# long-lived service, a tool that hangs *forever* leaks one worker per call
+# until the pool is exhausted and every tool call queues behind it — use
+# per-tool concurrency limits, or async tools with real cancellation, there.
 _POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="tool")
+_LLM_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm")
 
 
 def _validate_input(spec: ToolSpec, raw_args) -> dict:
@@ -613,7 +709,7 @@ class ToolExecutor:
         retrying = Retrying(
             stop=stop_after_attempt(policy.max_attempts),
             wait=wait_exponential_jitter(initial=policy.initial_s, max=policy.max_s, jitter=policy.jitter_s),
-            retry=retry_if_exception(is_retryable), sleep=self._sleep, reraise=True)
+            retry=retry_if_exception(spec.classify), sleep=self._sleep, reraise=True)
         try:
             raw_out = retrying(attempt)
         except BudgetExceeded as e:

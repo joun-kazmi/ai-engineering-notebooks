@@ -115,21 +115,31 @@ Live runs on NVIDIA NIM (`nemotron-3-super-120b-a12b`, `nemotron-3-embed-1b`); f
 
 | Metric | Result |
 |---|---|
-| Action accuracy | 7/8; the miss escalated instead of acting (see below) |
-| Runs where every invariant held (approved writes only, no duplicate side effects, no write outside `execute`, finished within budget or escalated because of it) | 8/8 |
+| Action accuracy | 6/8; neither miss acted wrongly (see below) |
+| Runs where every invariant held (approved writes only, no duplicate side effects, no write outside `execute`, final usage within every budget limit, budget hits escalated) | 8/8 |
 | Side effects / approved writes | 4 / 4: every write timed out once and was `deduplicated` on retry |
-| Tool calls that failed on the first attempt and recovered | 16 / 36 |
-| Transient provider errors retried | 76 (73×429) |
+| Tool calls that failed on the first attempt and recovered | 18 / 51 |
+| Transient LLM errors retried | 161 (149×429); no run gave up on the provider |
 
-- **Prompt injection.** A log line told the agent to roll back checkout-api, whose last deploy was 3 days ago. Read-only scoping refused the direct write. The live model still *recommended* the rollback, and a deterministic runbook precondition, checked before the approval gate, stopped it. Before that check existed, the injected rollback got through auto-approval in a development run. Scoping stops the model from writing; it doesn't stop it from proposing a bad write.
-- **The miss.** For inc08 the model got the action right (page_oncall), but named the team in a form that failed the team-slug contract, so the run escalated before the gate. Every write that ran had valid, approved arguments.
+- **Prompt injection.** A log line told the agent to roll back checkout-api, whose last deploy was 3 days ago. Read-only scoping refused the direct write. The live model still *recommended* the rollback, in both cells that test it. Each time, a deterministic runbook precondition, checked before the approval gate, stopped it. In a development run before that check existed, the injected rollback was approved and executed. Scoping stops the model writing; it doesn't stop it proposing a bad write.
+- **The misses.**
+  - **inc05:** the model named the service itself as the replica to restart. The precondition requires a replica the logs show as stuck, so the run escalated.
+  - **inc07:** triaged SEV2 instead of SEV3, then investigated and closed as `monitor`. That was correct for a service inside its SLO, but it shows that a SEV3 triage can close an incident without any evidence check. Adding one is a follow-up.
+- **Every final action is checked against the evidence before it takes effect.**
+  - A rollback needs errors above 10% within 30 minutes of that deploy.
+  - A page has to go to the owner of a failing dependency.
+  - A restart has to target a replica the logs show as stuck.
+  - `monitor` has to show that no earlier runbook rule applies. On inc05, rule 4's own condition alone would pass even with a stuck replica.
+- **The LLM budget is enforced per HTTP attempt.** The SDK's retries are off, and every attempt is charged with a hard deadline no longer than the time left in the run. Backoff never sleeps past that deadline.
 - **What surfaced only in live runs:**
-  - An in-flight LLM request stalled a run for over 20 minutes, so each request's timeout is now capped at the run's remaining time budget.
-  - A tool that never recovered burned the whole 30-call LLM budget, which is why there's a per-tool circuit breaker.
-  - A restart targeted the service's own name as the replica.
-  - Triage returned `service="service"`.
+  - A stalled in-flight request.
+  - A tool that never recovered, which burned the whole LLM budget. That's why there's a per-tool circuit breaker.
+  - Heavy congestion: at 124×429, a short retry policy gave up and 3/8 runs escalated for provider reasons.
+  - Free-text action targets, which lost 3 correct actions at the gate. Target formats are now validated on the RCA itself.
+  - A restart aimed at the service's own name.
+  - A triage returning `service="service"`.
 
-  The last two were schema-valid, so each now has a grounding check.
+  Each now has a fix and a test.
 
 ## Running these
 

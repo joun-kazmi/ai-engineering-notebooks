@@ -16,7 +16,8 @@ from pydantic import BaseModel, ConfigDict
 import ai_engineering.agent_eval as ae
 import ai_engineering.agent_reliability as ar
 from ai_engineering.tool_runtime import (
-    AuditLog, BudgetedChatClient, BudgetExceeded, BudgetLimits, InvalidToolInput, Permission, PermissionDenied,
+    AuditLog, BudgetedChatClient, BudgetExceeded, BudgetLimits, InvalidToolInput, LLMUnavailable, Permission,
+    PermissionDenied,
     RetryPolicy, RunBudget, ToolExecutor, ToolRegistry, ToolSpec, ToolTimeout, decide, idempotency_key,
     is_retryable, propose,
 )
@@ -499,7 +500,8 @@ def test_proposal_that_fails_the_tool_contract_never_reaches_the_gate():
     drop = ar.Fault(malformed=lambda o: {**o, "matches": [m for m in o["matches"] if "heartbeat" not in m]})
     seen = []
     r = run("inc05", faults={"search_logs": drop}, approve=lambda p: (seen.append(p) or True, "alice"))
-    assert not seen and "fail the tool contract" in r.state["halted"]
+    # Now caught on the RCA itself (the write tool's argument format), before propose_action
+    assert not seen and "action_target for restart_service" in r.state["halted"]
 
 
 def test_evidence_about_another_service_is_stopped_before_the_gate():
@@ -510,21 +512,58 @@ def test_evidence_about_another_service_is_stopped_before_the_gate():
     assert not seen and ae.WRONG_SERVICE in r.state["halted"]
 
 
-def test_action_preconditions_come_from_the_evidence():
-    obs = {"get_recent_deploys": {"deploys": [{"version": "v5.2.0", "minutes_ago": 4320, "author": "lee"}]},
-           "get_metrics": {"replicas_healthy": "8/8"}}
+def observations_for(inc_id, **metrics):
+    fx = INC[inc_id]["fixtures"]
+    svc = INC[inc_id]["service"]
+    return {"search_logs": {"matches": fx["logs"]}, "get_recent_deploys": {"deploys": fx["deploys"]},
+            "get_metrics": {"service": svc, **fx["metrics"], **metrics},
+            "get_dependencies": {"dependencies": fx["dependencies"]}}
+
+
+def test_rollback_precondition():
+    obs = observations_for("inc02")  # v5.2.0, deployed 3 days ago
     assert "4320 minutes ago" in ar.action_precondition("rollback_deploy", {"from_version": "v5.2.0"}, obs)
     assert "not among" in ar.action_precondition("rollback_deploy", {"from_version": "v9.9.9"}, obs)
-    assert "all replicas are healthy" in ar.action_precondition("restart_service", {"replica": "worker-1"}, obs)
-    assert ar.action_precondition("page_oncall", {"team": "db-team"}, obs) is None
-    # a live run proposed restarting the service's own name as the "replica"
-    obs["get_metrics"]["replicas_healthy"] = "3/4"
-    obs["search_logs"] = {"matches": ["11:05:00 WARN notifications-service: worker-3 no heartbeat for 25m"]}
+    obs = observations_for("inc01")  # v2.14.3, 9 minutes ago, 31% errors
+    assert ar.action_precondition("rollback_deploy", {"from_version": "v2.14.3"}, obs) is None
+    obs = observations_for("inc01", error_rate=0.04)
+    assert "above 10%" in ar.action_precondition("rollback_deploy", {"from_version": "v2.14.3"}, obs)
+
+
+def test_restart_precondition_grounds_the_replica_in_the_logs():
+    obs = observations_for("inc05")  # 3/4 healthy, worker-3 stuck
     assert ar.action_precondition("restart_service", {"replica": "worker-3"}, obs) is None
-    assert "doesn't appear in the logs" in ar.action_precondition(
-        "restart_service", {"replica": "notifications-service-1"}, obs)
-    obs["get_recent_deploys"]["deploys"][0]["minutes_ago"] = 9
-    assert ar.action_precondition("rollback_deploy", {"from_version": "v5.2.0"}, obs) is None
+    # a live run proposed restarting the service's own name as the "replica"
+    # ...which does appear in every log line, so "mentioned in the logs" isn't enough
+    assert "isn't a replica the logs show as stuck (stuck: ['worker-3'])" in ar.action_precondition(
+        "restart_service", {"replica": "notifications-service"}, obs)
+    assert "isn't a replica" in ar.action_precondition("restart_service", {"replica": "worker-1"}, obs)
+    assert "all replicas are healthy" in ar.action_precondition(
+        "restart_service", {"replica": "worker-1"}, observations_for("inc01"))
+
+
+def test_page_precondition_requires_the_owner_of_a_failing_dependency():
+    obs = observations_for("inc02")  # postgres-primary (db-team) saturated
+    assert ar.action_precondition("page_oncall", {"team": "db-team"}, obs) is None
+    assert "doesn't own a failing dependency" in ar.action_precondition(
+        "page_oncall", {"team": "partner-integrations"}, obs)
+    # runbook rule 5 has no evidence-backed target
+    assert "no dependency is failing" in ar.action_precondition(
+        "page_oncall", {"team": "payments-api-oncall"}, observations_for("inc01"))
+
+
+@pytest.mark.parametrize("inc_id, reason", [
+    ("inc01", "rule 1 applies"),         # 31% errors 9 minutes after a deploy
+    ("inc02", "rule 2 applies"),         # db-team's postgres saturated
+    ("inc05", "only 3/4 replicas"),      # inside SLO, but a replica is stuck
+])
+def test_monitor_must_show_no_other_rule_applies(inc_id, reason):
+    assert reason in ar.action_precondition("monitor", {}, observations_for(inc_id))
+
+
+def test_monitor_precondition_passes_inside_slo():
+    assert ar.action_precondition("monitor", {}, observations_for("inc06")) is None
+    assert "not inside SLO" in ar.action_precondition("monitor", {}, observations_for("inc06", p95_latency_ms=900))
 
 
 def test_steered_rollback_is_stopped_before_the_gate(monkeypatch):
@@ -547,3 +586,179 @@ def test_triage_service_must_appear_in_the_alert(monkeypatch):
     r = run("inc01")
     assert r.state["halted"] == "triage: service 'service' does not appear in the alert"
     assert not r.audit.records
+
+
+def steer(monkeypatch, **update):
+    """Make the offline RCA recommend something else, as a steered model would."""
+    real = ae._offline_rca
+    monkeypatch.setattr(ae, "_offline_rca", lambda trace, sev: real(trace, sev).model_copy(update=update))
+
+
+@pytest.mark.parametrize("inc_id", ["inc01", "inc05"])
+def test_steered_monitor_cannot_close_an_incident_that_needs_action(monkeypatch, inc_id):
+    steer(monkeypatch, next_action="monitor")
+    r = run(inc_id)
+    assert r.action == "escalated" and "monitor not supported by the evidence" in r.state["halted"]
+    assert not r.outcome.startswith("No write action")
+
+
+def test_page_to_a_team_the_evidence_does_not_name_is_stopped(monkeypatch):
+    monkeypatch.setattr(ar, "_offline_target", lambda action, obs, svc: "payments-team")
+    seen = []
+    r = run("inc02", approve=lambda p: (seen.append(p) or True, "alice"))
+    assert not seen and "doesn't own a failing dependency" in r.state["halted"]
+
+
+def test_verifier_that_never_accepts_escalates_without_an_rca(monkeypatch):
+    monkeypatch.setattr(ar, "_offline_verdict", lambda svc, draft: ae.Verdict(verdict="revise", feedback="not convinced"))
+    seen = []
+    r = run("inc01", approve=lambda p: (seen.append(p) or True, "alice"))
+    assert r.state["halted"] == "verify: investigation still rejected after 3 passes: not convinced"
+    assert "report" not in r.state and not seen and not r.infra.effects
+
+
+def test_runbook_is_required_evidence():
+    r = run("inc01", faults={"check_runbook": ar.Fault(transient_failures=99)})
+    assert r.action == "escalated" and "check_runbook" in r.state["halted"]
+
+
+def test_invariant_checks_elapsed_time_directly():
+    r = run("inc01")
+    assert ar.check_invariants(r)["within_budget"]
+    r.budget.started -= 10_000  # as if an in-flight call ran far past max_seconds unnoticed
+    assert r.budget.exceeded is None and r.budget.overruns() == ["time_s"]
+    assert not ar.check_invariants(r)["within_budget"]
+
+
+# ---- per-tool retry classification
+
+def test_409_is_not_retried_for_writes_but_is_for_reads():
+    ex = make_executor(read_fn=Flaky(99, HTTPError(409)), write_fn=Flaky(99, HTTPError(409)))
+    assert ex.call("echo", {"service": "a"}, node="n").record.attempts == 3
+    res = ex.call("act", {"service": "a"}, node="execute", approval=approval_for(ex, "act", {"service": "a"}))
+    assert res.record.outcome == "failed" and res.record.attempts == 1
+
+
+def test_tool_can_override_retry_classification():
+    spec = ToolSpec("echo", "d", Flaky(99, ValueError("flaky sdk")), EchoIn, EchoOut,
+                    retry=RetryPolicy(3, 0.0, 0.0, 0.0), retryable=lambda e: isinstance(e, ValueError))
+    ex = ToolExecutor(ToolRegistry([spec]), "r", sleep=NO_SLEEP)
+    assert ex.call("echo", {"service": "a"}, node="n").record.attempts == 3
+
+
+# ---- BudgetedChatClient owns LLM retries
+
+class ScriptedChat:
+    """A chat client whose create() raises the scripted errors in order, then succeeds."""
+
+    def __init__(self, errors=(), delay_s=0.0):
+        self.errors, self.delay_s, self.kwargs = list(errors), delay_s, []
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
+
+        def create(**kw):
+            self.kwargs.append(kw)
+            time.sleep(self.delay_s)
+            if self.errors:
+                raise self.errors.pop(0)
+            return SimpleNamespace(usage=usage)
+
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
+
+
+def test_every_llm_attempt_is_charged_and_counted():
+    sleeps = []
+    fake = ScriptedChat([HTTPError(503), HTTPError(429)])
+    client = BudgetedChatClient(fake, RunBudget(), sleep=sleeps.append)
+    client.chat.completions.create(model="m")
+    assert client.budget.llm_calls == 3 and len(fake.kwargs) == 3
+    assert client.retried == {"503": 1, "429": 1} and len(sleeps) == 2
+    assert client.budget.tokens == 15
+
+
+def test_caller_cannot_widen_the_llm_timeout():
+    fake = ScriptedChat()
+    BudgetedChatClient(fake, RunBudget(), call_timeout_s=60).chat.completions.create(model="m", timeout=999)
+    assert fake.kwargs[0]["timeout"] == 60
+
+
+def test_llm_timeout_has_no_floor_below_the_remaining_budget():
+    clock = {"t": 0.0}
+    budget = RunBudget(BudgetLimits(max_seconds=10), clock=lambda: clock["t"])
+    fake = ScriptedChat()
+    clock["t"] = 9.7
+    BudgetedChatClient(fake, budget).chat.completions.create(model="m")
+    assert fake.kwargs[0]["timeout"] == pytest.approx(0.3)
+
+
+def test_stuck_llm_attempt_is_abandoned_at_its_deadline():
+    fake = ScriptedChat(delay_s=0.5)
+    client = BudgetedChatClient(fake, RunBudget(), call_timeout_s=0.05, retry=RetryPolicy(2, 0.0, 0.0, 0.0),
+                                sleep=NO_SLEEP)
+    start = time.perf_counter()
+    with pytest.raises(LLMUnavailable):
+        client.chat.completions.create(model="m")
+    assert time.perf_counter() - start < 0.4 and client.retried == {"timeout": 2}
+
+
+def test_llm_backoff_never_sleeps_past_the_deadline():
+    clock = {"t": 0.0}
+    budget = RunBudget(BudgetLimits(max_seconds=5), clock=lambda: clock["t"])
+    sleeps = []
+    client = BudgetedChatClient(ScriptedChat([HTTPError(503)] * 5), budget,
+                                retry=RetryPolicy(5, 10.0, 60.0, 0.0), sleep=sleeps.append)
+    with pytest.raises(BudgetExceeded, match="time_s"):
+        client.chat.completions.create(model="m")
+    assert sleeps == [] and budget.llm_calls == 1 and budget.exceeded == "time_s"
+
+
+def test_exhausted_llm_retries_are_not_retried_again_by_an_outer_wrapper(monkeypatch):
+    fake = ScriptedChat([HTTPError(503)] * 10)
+    client = BudgetedChatClient(fake, RunBudget(), retry=RetryPolicy(3, 0.0, 0.0, 0.0), sleep=NO_SLEEP)
+    monkeypatch.setattr("tenacity.nap.time.sleep", lambda s: None)
+    with pytest.raises(LLMUnavailable):
+        ae._chat(client, model="m")  # agent_eval's outer retry, keyed on OpenAI error types
+    assert len(fake.kwargs) == 3
+
+
+def test_non_retryable_llm_error_is_raised_immediately():
+    fake = ScriptedChat([HTTPError(400)])
+    with pytest.raises(HTTPError):
+        BudgetedChatClient(fake, RunBudget(), sleep=NO_SLEEP).chat.completions.create(model="m")
+    assert len(fake.kwargs) == 1
+
+
+@pytest.mark.parametrize("action, target, ok", [
+    ("rollback_deploy", "v2.14.3", True), ("rollback_deploy", "v2.14.3 (payments-api)", False),
+    ("page_oncall", "db-team", True), ("page_oncall", "The partner integrations team, who own card-gateway", False),
+    ("restart_service", "worker-3", True), ("restart_service", "worker-3 of notifications-service", False),
+    ("restart_service", None, False), ("monitor", None, True),
+])
+def test_rca_action_target_must_fit_the_write_tool(action, target, ok):
+    fields = dict(root_cause="x" * 25, evidence=["e"], severity="SEV2", next_action=action, action_target=target)
+    if ok:
+        ar.HardenedRCAReport(**fields)
+    else:
+        with pytest.raises(ValueError, match="action_target for"):
+            ar.HardenedRCAReport(**fields)
+
+
+def test_filtered_log_search_does_not_hide_earlier_evidence(monkeypatch):
+    """First pass searches all logs (finds the stuck worker-3); the verifier
+    sends it back once, and the second pass searches with a keyword filter
+    that excludes worker-3's line. The restart must still be grounded."""
+    verdicts = iter([ae.Verdict(verdict="revise", feedback="look again")])
+    monkeypatch.setattr(ar, "_offline_verdict", lambda svc, draft: next(verdicts, ae.Verdict(verdict="ok")))
+    real_call = ToolExecutor.call
+    searches = []
+
+    def call(self, name, raw_args, **kw):
+        if name == "search_logs":
+            searches.append(1)
+            if len(searches) > 1:
+                raw_args = {**raw_args, "keyword": "processed"}  # only worker-1/2's lines
+        return real_call(self, name, raw_args, **kw)
+
+    monkeypatch.setattr(ToolExecutor, "call", call)
+    r = run("inc05")
+    assert len(searches) == 2
+    assert r.action == "restart_service" and "restarted worker-3" in r.outcome, r.state.get("halted")
