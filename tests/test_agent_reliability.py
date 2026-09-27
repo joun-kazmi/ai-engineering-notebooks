@@ -6,6 +6,7 @@ rule-based stand-ins; every fault is injected deterministically and backoff
 sleeps are skipped.
 """
 import json
+import threading
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -847,3 +848,86 @@ def test_misclassified_sev3_is_investigated_when_metrics_show_impact(monkeypatch
 def test_sev3_close_without_metrics_escalates():
     r = run("inc03", faults={"get_metrics": ar.Fault(transient_failures=99)})
     assert r.action == "escalated" and "can't confirm a SEV3 close without metrics" in r.state["halted"]
+
+
+# ---- bulkheads: a hung tool can't take the others down
+
+from ai_engineering.tool_runtime import LLMSaturated, bulkhead  # noqa: E402
+
+
+def hung_tool_executor(release, limit=2, breaker=None):
+    calls = {"hung": 0, "healthy": 0}
+
+    def hangs(a, ctx):
+        calls["hung"] += 1
+        release.wait(timeout=5)
+        return a.model_dump()
+
+    def healthy(a, ctx):
+        calls["healthy"] += 1
+        return a.model_dump()
+
+    specs = [ToolSpec("hangs", "d", hangs, EchoIn, EchoOut, timeout_s=0.05, retry=RetryPolicy(1),
+                      max_concurrency=limit),
+             ToolSpec("healthy", "d", healthy, EchoIn, EchoOut, timeout_s=1.0, max_concurrency=limit)]
+    ex = ToolExecutor(ToolRegistry(specs), "r", sleep=NO_SLEEP, breaker_threshold=breaker)
+    return ex, calls
+
+
+def test_hung_calls_hold_their_slots_and_the_next_call_fails_fast():
+    release = threading.Event()
+    ex, calls = hung_tool_executor(release)
+    try:
+        first = [ex.call("hangs", {"service": "a"}, node="n").record.outcome for _ in range(2)]
+        assert first == ["timeout", "timeout"]
+        assert bulkhead("tool:hangs", 2).in_flight == 2  # timed out, still running
+
+        start = time.perf_counter()
+        third = ex.call("hangs", {"service": "a"}, node="n")
+        assert third.record.outcome == "saturated" and third.record.attempts == 0
+        assert time.perf_counter() - start < 0.05  # didn't wait for a slot
+        assert calls["hung"] == 2 and ex.budget.tool_calls == 2  # never ran, never charged
+
+        # Another tool is unaffected by the hung one.
+        assert ex.call("healthy", {"service": "a"}, node="n").ok and calls["healthy"] == 1
+    finally:
+        release.set()
+    for _ in range(100):
+        if bulkhead("tool:hangs", 2).in_flight == 0:
+            break
+        time.sleep(0.01)
+    assert bulkhead("tool:hangs", 2).in_flight == 0  # slots free once the calls return
+    assert ex.call("hangs", {"service": "a"}, node="n").ok
+
+
+def test_saturation_counts_toward_the_circuit_breaker():
+    release = threading.Event()
+    ex, _ = hung_tool_executor(release, limit=1, breaker=2)
+    try:
+        assert ex.call("hangs", {"service": "a"}, node="n").record.outcome == "timeout"
+        assert ex.call("hangs", {"service": "a"}, node="n").record.outcome == "saturated"
+        assert ex.call("hangs", {"service": "a"}, node="n").record.outcome == "circuit_open"
+    finally:
+        release.set()
+
+
+def test_a_budget_refusal_gives_the_slot_back():
+    released = threading.Event()
+    released.set()
+    ex, _ = hung_tool_executor(released, limit=1)
+    ex.budget = RunBudget(BudgetLimits(max_tool_calls=0))
+    with pytest.raises(BudgetExceeded):
+        ex.call("healthy", {"service": "a"}, node="n")
+    assert bulkhead("tool:healthy", 1).in_flight == 0
+
+
+def test_saturated_llm_slots_are_retried_without_charging():
+    slots = bulkhead("llm", 1)
+    assert slots.try_reserve()  # someone else holds the only LLM slot
+    fake = FakeChat(10, 5)
+    budget = RunBudget()
+    client = BudgetedChatClient(fake, budget, max_concurrency=1, sleep=lambda s: slots.cancel(),
+                                retry=RetryPolicy(3, 0.0, 0.0, 0.0))
+    client.chat.completions.create(model="m")  # saturated once; the backoff frees the slot; then succeeds
+    assert fake.calls == 1 and budget.llm_calls == 1 and client.retried == {"saturated": 1}
+    assert isinstance(LLMSaturated("x"), Exception) and is_retryable(LLMSaturated("x"))

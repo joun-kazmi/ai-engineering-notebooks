@@ -558,3 +558,87 @@ def test_checkpoint_fence_check_and_write_are_one_transaction(db, clock, monkeyp
     with pytest.raises(serve.FencedOut):
         cp.put_writes(config, [("x", 1)], "task")
     assert len(list(svc.checkpointer.list({"configurable": {"thread_id": "t1"}}))) == 1  # nothing after it
+
+
+# ---- tracing: one trace per run, a span per request
+
+from langchain_core.callbacks import BaseCallbackHandler  # noqa: E402
+
+
+class RecordingTracer:
+    """Stands in for LangfuseTracer: records each span, what the graph ran
+    under it, and what was recorded on it."""
+
+    def __init__(self):
+        self.spans = []
+
+    def span(self, thread_id, name, input=None):
+        tracer = self
+
+        class Span:
+            def __init__(self):
+                self.record = {"trace": thread_id, "name": name, "input": input, "nodes": [],
+                               "output": None, "trace_io": {}}
+
+            def __enter__(self):
+                tracer.spans.append(self.record)
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def update(self, output=None, metadata=None):
+                self.record["output"], self.record["metadata"] = output, metadata
+
+            def set_trace_io(self, **io):
+                self.record["trace_io"].update(io)
+
+        return Span()
+
+    def callbacks(self):
+        current = self.spans[-1]
+
+        class Nodes(BaseCallbackHandler):
+            def on_chain_start(self, serialized, inputs, *, run_id, parent_run_id=None, **kwargs):
+                name = kwargs.get("name") or (serialized or {}).get("name")
+                if name in ar.WRITE_ACTIONS or name in ("triage", "investigate", "verify", "write_rca",
+                                                        "propose_action", "human_gate", "execute", "confirm_close"):
+                    current["nodes"].append(name)
+
+        return [Nodes()]
+
+    def url(self, thread_id):
+        return f"https://langfuse.example/trace/{thread_id}"
+
+
+def test_every_request_on_a_run_is_a_span_in_its_one_trace(db, clock, monkeypatch):
+    tracer = RecordingTracer()
+    serve.configure(db, clock=clock, approval_ttl_s=3600, retention_s=86400, lease_s=300, tracer=tracer)
+    client = TestClient(serve.app_fastapi)
+    run = alert(client)
+
+    # Crash after the claim, then a new process recovers it: three requests, two processes.
+    monkeypatch.setattr(ar.RunHandle, "resume", lambda self, *a: (_ for _ in ()).throw(SimulatedCrash()))
+    with pytest.raises(SimulatedCrash):
+        serve.service().approve(run["thread_id"], True, "alice", run["proposal"]["args_hash"])
+    monkeypatch.undo()
+    serve.configure(db, clock=clock, approval_ttl_s=3600, retention_s=86400, lease_s=300, tracer=tracer)
+    clock.t += 301
+    client.post(f"/runs/{run['thread_id']}/recover")
+
+    assert [s["name"] for s in tracer.spans] == ["served:alert", "served:approve", "served:recover"]
+    assert {s["trace"] for s in tracer.spans} == {run["thread_id"]}  # one trace for the whole run
+    alert_span, _, recover_span = tracer.spans
+    assert alert_span["input"] == {"alert": INC["inc01"]["alert"]}
+    assert {"triage", "investigate", "propose_action", "human_gate"} <= set(alert_span["nodes"])
+    assert "execute" not in alert_span["nodes"] and "execute" in recover_span["nodes"]
+    assert recover_span["output"]["status"] == "completed"
+    assert recover_span["trace_io"]["output"]["status"] == "completed"
+    assert recover_span["metadata"]["budget"]["tool_calls"].startswith("6/")
+    assert client.get(f"/runs/{run['thread_id']}").json()["trace_url"].endswith(run["thread_id"])
+
+
+def test_without_langfuse_there_is_no_tracing(client):
+    run = alert(client)
+    assert isinstance(serve.service().tracer, serve.NullTracer)
+    assert get(client, run)["trace_url"] is None

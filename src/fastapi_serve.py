@@ -41,6 +41,10 @@ in the same SQLite file, written as they change. So:
     so a worker that was only stalled can't overwrite a recovered run;
   * checkpoints are written synchronously and deserialized strictly.
 
+Tracing. With LANGFUSE_* set, each run is one Langfuse trace, and every
+request on it (alert, approve, recover) is a span inside it, holding that
+request's LangGraph node tree and LLM generations (LangfuseTracer).
+
 Tools read a demo service catalog (each service's fixtures from the first
 incident about it in data/incident_eval_set.json) and write to a simulated
 backend, one per run, persisted with the run.
@@ -49,7 +53,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -152,6 +156,51 @@ class FencedCheckpointer(SqliteSaver):
                 cur.close()
 
 
+class NullTracer:
+    """No tracing (Langfuse not configured)."""
+
+    def span(self, thread_id: str, name: str, input=None):
+        return nullcontext(None)
+
+    def callbacks(self) -> list:
+        return []
+
+    def url(self, thread_id: str) -> str | None:
+        return None
+
+
+class LangfuseTracer:
+    """One Langfuse trace per run, however many requests and processes it
+    takes. The trace id is derived from the run's thread_id, so /alert,
+    /approve and /recover — possibly in different processes, days apart —
+    each add a span to the same trace without anything stored to link them.
+    Inside a span, the LangGraph callback nests the node tree and the
+    Langfuse-wrapped LLM client nests each generation."""
+
+    def __init__(self, lf):
+        self.lf = lf
+
+    def trace_id(self, thread_id: str) -> str:
+        return self.lf.create_trace_id(seed=thread_id)
+
+    def span(self, thread_id: str, name: str, input=None):
+        return self.lf.start_as_current_observation(trace_context={"trace_id": self.trace_id(thread_id)},
+                                                    name=name, as_type="span", input=input)
+
+    def callbacks(self) -> list:
+        from langfuse.langchain import CallbackHandler
+
+        return [CallbackHandler()]
+
+    def url(self, thread_id: str) -> str | None:
+        return self.lf.get_trace_url(trace_id=self.trace_id(thread_id))
+
+
+def default_tracer():
+    lf = ae.langfuse_client()
+    return LangfuseTracer(lf) if lf is not None else NullTracer()
+
+
 # ══════════════════════════════════════════════════════════
 # 2. THE SERVICE
 # ══════════════════════════════════════════════════════════
@@ -160,7 +209,7 @@ class Service:
     (processes) can share one database; `clock` is wall-clock time."""
 
     def __init__(self, db_path: str | Path, approval_ttl_s: float, retention_s: float, lease_s: float,
-                 clock=time.time):
+                 clock=time.time, tracer=None):
         self.db_path = str(db_path)
         self.store = RunStore(db_path)
         # For reading checkpoints and deleting purged ones; runs write through
@@ -169,6 +218,7 @@ class Service:
         self.checkpointer.setup()
         self.approval_ttl_s, self.retention_s, self.lease_s = approval_ttl_s, retention_s, lease_s
         self.clock = clock
+        self.tracer = tracer or default_tracer()
 
     # ---- building a run, new or from the store
 
@@ -246,6 +296,26 @@ class Service:
 
     # ---- the API
 
+    @contextmanager
+    def _traced(self, thread_id: str, name: str, run_input=None):
+        """A span for this request in the run's trace; yields a function that
+        attaches the run to it (LangGraph callbacks) and one that records the
+        result."""
+        with self.tracer.span(thread_id, name, input=run_input) as span:
+            def attach(run: ar.RunHandle) -> ar.RunHandle:
+                run.config["callbacks"] = self.tracer.callbacks()
+                return run
+
+            def record(result: dict, run: ar.RunHandle) -> dict:
+                if span is not None:
+                    span.update(output=result, metadata={"budget": run.budget.snapshot()})
+                    span.set_trace_io(output=result)
+                return result
+
+            if span is not None and run_input is not None:
+                span.set_trace_io(input=run_input)
+            yield attach, record
+
     @staticmethod
     def _taken_over(thread_id: str) -> ServiceError:
         return ServiceError(409, {"error": "This process's claim on the run was revoked (it was presumed dead and "
@@ -256,12 +326,13 @@ class Service:
         self.housekeeping()
         thread_id = str(uuid.uuid4())
         self.store.create(thread_id, alert_text, self.clock())  # epoch 1
-        try:
-            run = self._open(thread_id, alert_text, epoch=1)
-            run.start()
-            return self._settle(thread_id, run, 1, "starting")
-        except FencedOut:
-            raise self._taken_over(thread_id) from None
+        with self._traced(thread_id, "served:alert", {"alert": alert_text}) as (attach, record):
+            try:
+                run = attach(self._open(thread_id, alert_text, epoch=1))
+                run.start()
+                return record(self._settle(thread_id, run, 1, "starting"), run)
+            except FencedOut:
+                raise self._taken_over(thread_id) from None
 
     def approve(self, thread_id: str, approved: bool, approver: str, args_hash: str) -> dict:
         row = self._row(thread_id)
@@ -291,12 +362,13 @@ class Service:
         epoch = self.store.claim(thread_id, "awaiting_approval", "executing", self.clock(), decision=decision)
         if epoch is None:
             return self.approve(thread_id, approved, approver, args_hash)
-        try:
-            run = self._open(thread_id, row["alert"], epoch, self.store.get(thread_id))
-            run.resume(approved, approver)
-            return {**self._settle(thread_id, run, epoch, "executing", decision), "replayed": False}
-        except FencedOut:
-            raise self._taken_over(thread_id) from None
+        with self._traced(thread_id, "served:approve") as (attach, record):
+            try:
+                run = attach(self._open(thread_id, row["alert"], epoch, self.store.get(thread_id)))
+                run.resume(approved, approver)
+                return record({**self._settle(thread_id, run, epoch, "executing", decision), "replayed": False}, run)
+            except FencedOut:
+                raise self._taken_over(thread_id) from None
 
     def recover(self, thread_id: str) -> dict:
         """Continue an interrupted run. Where to continue from depends on how
@@ -322,24 +394,25 @@ class Service:
         if epoch is None:
             raise ServiceError(409, "Another request is already recovering this run")
         decision = row["decision"]
-        try:
-            run = self._open(thread_id, row["alert"], epoch, self.store.get(thread_id))
-            if self.checkpointer.get_tuple(run.config) is None:
-                run.start()
-            elif run.pending_proposal is not None:
-                if decision is not None:
-                    run.resume(decision["approved"], decision["approver"])
-            else:
-                run.recover()
-            return self._settle(thread_id, run, epoch, resuming, decision)
-        except FencedOut:
-            raise self._taken_over(thread_id) from None
+        with self._traced(thread_id, "served:recover") as (attach, record):
+            try:
+                run = attach(self._open(thread_id, row["alert"], epoch, self.store.get(thread_id)))
+                if self.checkpointer.get_tuple(run.config) is None:
+                    run.start()
+                elif run.pending_proposal is not None:
+                    if decision is not None:
+                        run.resume(decision["approved"], decision["approver"])
+                else:
+                    run.recover()
+                return record(self._settle(thread_id, run, epoch, resuming, decision), run)
+            except FencedOut:
+                raise self._taken_over(thread_id) from None
 
     def get(self, thread_id: str) -> dict:
         row = self._row(thread_id)
         budget = RunBudget.from_dict(row["budget"], LIMITS) if row["budget"] else RunBudget(LIMITS)
         return {**self.summary(row), "budget": budget.snapshot(), "audit": self.store.audit(thread_id),
-                "side_effects": (row["infra"] or {}).get("effects", [])}
+                "side_effects": (row["infra"] or {}).get("effects", []), "trace_url": self.tracer.url(thread_id)}
 
 
 _service: Service | None = None
@@ -354,7 +427,7 @@ def configure(db_path: str | Path | None = None, **overrides) -> Service:
                        approval_ttl_s=overrides.get("approval_ttl_s", s.approval_ttl_s),
                        retention_s=overrides.get("retention_s", s.run_retention_s),
                        lease_s=overrides.get("lease_s", s.run_lease_s),
-                       clock=overrides.get("clock", time.time))
+                       clock=overrides.get("clock", time.time), tracer=overrides.get("tracer"))
     return _service
 
 
