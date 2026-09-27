@@ -345,6 +345,9 @@ class RunBudget:
         self.prompt_tokens = self.completion_tokens = 0
         self.exceeded: str | None = None  # first limit hit, if any
         self._suspended_at: float | None = None
+        # Called after every change to the counters or the clock, e.g. to
+        # persist the budget so a crash doesn't hide what the run had spent.
+        self.on_change: Callable[["RunBudget"], None] | None = None
 
     @property
     def tokens(self) -> int:
@@ -371,11 +374,13 @@ class RunBudget:
         Idempotent, because LangGraph re-executes the interrupted node on resume."""
         if self._suspended_at is None:
             self._suspended_at = self._clock()
+            self._changed()
 
     def resume(self) -> None:
         if self._suspended_at is not None:
             self.started += self._clock() - self._suspended_at
             self._suspended_at = None
+            self._changed()
 
     def remaining_s(self) -> float | None:
         if self.limits.max_seconds is None:
@@ -401,20 +406,51 @@ class RunBudget:
         self._check_spent()
         self._check("llm_calls", self.llm_calls + 1, self.limits.max_llm_calls)
         self.llm_calls += 1
+        self._changed()
 
     def record_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
         self.prompt_tokens += prompt_tokens or 0
         self.completion_tokens += completion_tokens or 0
+        self._changed()
 
     def charge_tool_call(self) -> None:
         self._check_spent()
         self._check("tool_calls", self.tool_calls + 1, self.limits.max_tool_calls)
         self.tool_calls += 1
+        self._changed()
 
     def charge_graph_step(self) -> None:
         self._check_spent()
         self._check("graph_steps", self.graph_steps + 1, self.limits.max_graph_steps)
         self.graph_steps += 1
+        self._changed()
+
+    def _changed(self) -> None:
+        if self.on_change is not None:
+            self.on_change(self)
+
+    def to_dict(self) -> dict:
+        """What's been spent, for persisting. Elapsed time is stored as a
+        duration (the clock is per process), plus whether the clock was
+        stopped — e.g. at an approval gate."""
+        return {"llm_calls": self.llm_calls, "tool_calls": self.tool_calls, "graph_steps": self.graph_steps,
+                "prompt_tokens": self.prompt_tokens, "completion_tokens": self.completion_tokens,
+                "elapsed_s": self.elapsed_s, "suspended": self._suspended_at is not None, "exceeded": self.exceeded}
+
+    @classmethod
+    def from_dict(cls, data: dict, limits: "BudgetLimits" = None, usd_per_mtok_in: float | None = None,
+                  usd_per_mtok_out: float | None = None, clock: Callable[[], float] = time.monotonic) -> "RunBudget":
+        """Continue a persisted budget in this process. Time that passed while
+        no process was running the run (a restart, a crash) isn't counted:
+        the clock resumes from the stored elapsed time."""
+        budget = cls(limits or BudgetLimits(), usd_per_mtok_in, usd_per_mtok_out, clock)
+        for name in ("llm_calls", "tool_calls", "graph_steps", "prompt_tokens", "completion_tokens", "exceeded"):
+            setattr(budget, name, data[name])
+        now = clock()
+        budget.started = now - data["elapsed_s"]
+        if data["suspended"]:
+            budget._suspended_at = now
+        return budget
 
     def overruns(self, time_grace_s: float = 1.0) -> list[str]:
         """Limits the run's *final* usage is over, checked directly rather than
@@ -670,13 +706,27 @@ class ToolExecutor:
         self.failures: dict[str, int] = {}  # consecutive failed calls per tool, for the breaker
         self.breaker_threshold = breaker_threshold
         self._sleep = sleep
+        # Called after every call's audit record, ledger and breaker count are
+        # updated, e.g. to persist them.
+        self.on_finish: Callable[["ToolExecutor"], None] | None = None
 
     def with_registry(self, registry: ToolRegistry) -> "ToolExecutor":
         """Same run, budget, audit log, ledger and breaker; different tool scope."""
         ex = ToolExecutor(registry, self.run_id, self.budget, self.audit, self._sleep, self.breaker_threshold)
         ex.completed = self.completed
         ex.failures = self.failures
+        ex.on_finish = self.on_finish
         return ex
+
+    def state(self) -> dict:
+        """The idempotency ledger and breaker counts, for persisting."""
+        return {"completed": self.completed, "failures": self.failures}
+
+    def restore(self, state: dict) -> None:
+        """Load persisted ledger and breaker counts (in place: scoped views
+        made by with_registry share these dicts)."""
+        self.completed.update(state.get("completed", {}))
+        self.failures.update(state.get("failures", {}))
 
     def circuit_open(self, name: str) -> bool:
         return self.breaker_threshold is not None and self.failures.get(name, 0) >= self.breaker_threshold
@@ -701,6 +751,8 @@ class ToolExecutor:
                 self.failures[name] = 0
             elif outcome in ("failed", "timeout", "invalid_output"):
                 self.failures[name] = self.failures.get(name, 0) + 1
+            if self.on_finish is not None:
+                self.on_finish(self)
             return ToolResult(ok, output if ok else None, None if ok else rec.error, rec)
 
         try:

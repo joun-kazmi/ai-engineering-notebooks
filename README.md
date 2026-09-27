@@ -77,7 +77,7 @@ Multi-step agents on LangGraph, using incident response and support triage as th
 
 | File | What it covers |
 |---|---|
-| [`src/fastapi_serve.py`](src/fastapi_serve.py) | The hardened escalation agent served over FastAPI. `/alert` returns the proposal waiting at the approval gate. `/approve` must name that proposal's `args_hash`, and a repeated submit replays the stored result instead of acting twice. `/runs/{id}` returns the budget and the audit log. |
+| [`src/fastapi_serve.py`](src/fastapi_serve.py) | The hardened escalation agent served over FastAPI. `/alert` returns the proposal waiting at the approval gate. `/approve` must name that proposal's `args_hash`, and a repeated submit replays the stored result instead of acting twice. `/runs/{id}` returns the budget and the audit log. Runs are stored in SQLite: a pending approval survives a restart, an approval is claimed atomically across processes, and a run whose process crashed can be recovered without repeating a write it already made. |
 
 ---
 
@@ -235,7 +235,18 @@ curl -s -X POST localhost:8000/approve -H 'content-type: application/json' \
   -d '{"thread_id": "...", "approved": true, "approver": "alice", "args_hash": "fd788be9149bbff0"}'
 ```
 
-Runs are kept in process memory for now, so a restart loses them.
+Runs are durable. LangGraph's `SqliteSaver` stores the graph checkpoints. A run store in the same file (`SERVE_DB_PATH`, default `.data/serve.sqlite3`) keeps each run's status, decision, budget, idempotency ledger, circuit-breaker counts, simulated backend and audit log, and writes each one as it changes. As a result:
+
+- **A pending approval survives a restart.** It resumes from its checkpoint with its budget and audit log intact.
+- **An approval executes exactly once,** across threads and processes. It's claimed with a compare-and-set on the run's status. While it runs, `GET /runs/{id}` reads `executing` instead of waiting.
+- **A proposal left undecided past `APPROVAL_TTL_S` expires** (default 24 h), and approving it returns `410 Gone`, because its evidence is stale. Settled runs are purged after `RUN_RETENTION_S` (default 7 days).
+- **A run whose process died mid-execution becomes `interrupted`** after `RUN_LEASE_S` of silence (default 300 s; a running run writes on every budget charge). `POST /runs/{id}/recover` continues it from the point it reached, using the stored decision and the checkpoint together:
+  - **No checkpoint yet:** it starts again from the stored alert.
+  - **Approval claimed but not delivered:** the stored decision is delivered.
+  - **Back at the gate:** it waits for approval again.
+  - **Anywhere else:** it continues from the last checkpoint. A write it had already made is re-sent with the same idempotency key and deduplicated, so nothing happens twice.
+- **A worker presumed dead can't overwrite a recovered run.** Every claim, recovery and stale-marking bumps the run's epoch, and every write requires the current epoch. That covers run state, audit records and LangGraph checkpoints. A stalled worker that wakes up after its run was recovered fails on its next write and stops. (With a real backend, the epoch would also be sent to it as a fencing token.)
+- **Checkpoints are written synchronously** (`durability="sync"`), so a crash can't lose a finished step. They are also **deserialized strictly**, so a tampered database can't make the service construct arbitrary Python objects.
 
 To run the offline smoke tests (no API keys or LLM calls; the same suite runs in CI):
 

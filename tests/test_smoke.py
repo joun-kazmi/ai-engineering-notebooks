@@ -115,7 +115,7 @@ def test_readme_serve_command_targets_the_fastapi_app(serve):
 
 def test_service_exposes_expected_routes(serve):
     paths = {r.path for r in serve.app_fastapi.routes}
-    assert {"/generate", "/alert", "/approve", "/runs/{thread_id}"} <= paths
+    assert {"/generate", "/alert", "/approve", "/runs/{thread_id}", "/runs/{thread_id}/recover"} <= paths
 
 
 def test_approve_unknown_thread_returns_404(serve):
