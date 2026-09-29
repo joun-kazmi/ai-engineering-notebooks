@@ -931,3 +931,33 @@ def test_saturated_llm_slots_are_retried_without_charging():
     client.chat.completions.create(model="m")  # saturated once; the backoff frees the slot; then succeeds
     assert fake.calls == 1 and budget.llm_calls == 1 and client.retried == {"saturated": 1}
     assert isinstance(LLMSaturated("x"), Exception) and is_retryable(LLMSaturated("x"))
+
+
+
+def test_conflicting_bulkhead_limits_fail_instead_of_being_ignored():
+    ToolRegistry([ToolSpec("rollback", "d", lambda a, c: {}, EchoIn, EchoOut, max_concurrency=4)])
+    with pytest.raises(ValueError, match="already exists with limit 4; requested 1"):
+        ToolRegistry([ToolSpec("rollback", "d", lambda a, c: {}, EchoIn, EchoOut, max_concurrency=1)])
+    ToolRegistry([ToolSpec("rollback", "d", lambda a, c: {}, EchoIn, EchoOut, max_concurrency=4)])  # same: fine
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        ToolRegistry([ToolSpec("broken", "d", lambda a, c: {}, EchoIn, EchoOut, max_concurrency=0)])
+
+
+def test_conflicting_llm_bulkhead_limits_fail_too():
+    BudgetedChatClient(FakeChat(1, 1), RunBudget())  # default 32
+    with pytest.raises(ValueError, match="'llm' already exists with limit 32; requested 8"):
+        BudgetedChatClient(FakeChat(1, 1), RunBudget(), max_concurrency=8)
+
+
+def test_a_tool_s_slots_are_shared_across_runs():
+    """Run A's hung calls fill tool X's slots; run B, a separate executor,
+    finds X saturated — and its other tool still works."""
+    release = threading.Event()
+    run_a, _ = hung_tool_executor(release, limit=2)
+    run_b, calls_b = hung_tool_executor(release, limit=2)
+    try:
+        assert [run_a.call("hangs", {"service": "a"}, node="n").record.outcome for _ in range(2)] == ["timeout"] * 2
+        assert run_b.call("hangs", {"service": "b"}, node="n").record.outcome == "saturated"
+        assert run_b.call("healthy", {"service": "b"}, node="n").ok and calls_b["hung"] == 0
+    finally:
+        release.set()

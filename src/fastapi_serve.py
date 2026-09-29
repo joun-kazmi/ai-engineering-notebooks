@@ -42,8 +42,10 @@ in the same SQLite file, written as they change. So:
   * checkpoints are written synchronously and deserialized strictly.
 
 Tracing. With LANGFUSE_* set, each run is one Langfuse trace, and every
-request on it (alert, approve, recover) is a span inside it, holding that
-request's LangGraph node tree and LLM generations (LangfuseTracer).
+request on it (alert, approve, recover) is a span inside it: executions hold
+their LangGraph node tree and LLM generations; replays and rejections
+(conflict, stale hash, expiry) are recorded too, rejections as WARNING,
+crashes as ERROR (LangfuseTracer). Requests for unknown runs aren't traced.
 
 Tools read a demo service catalog (each service's fixtures from the first
 incident about it in data/incident_eval_set.json) and write to a simulated
@@ -297,24 +299,37 @@ class Service:
     # ---- the API
 
     @contextmanager
-    def _traced(self, thread_id: str, name: str, run_input=None):
-        """A span for this request in the run's trace; yields a function that
-        attaches the run to it (LangGraph callbacks) and one that records the
-        result."""
-        with self.tracer.span(thread_id, name, input=run_input) as span:
+    def _traced(self, thread_id: str, name: str, request=None, trace_input=None):
+        """A span for this request in the run's trace. Yields `attach(run)`,
+        which puts the run's LangGraph node tree under the span, and
+        `record(result, run=None)`, which records what the request returned.
+        A rejected request (ServiceError) is recorded as a WARNING with its
+        status code; anything else that escapes, as an ERROR."""
+        with self.tracer.span(thread_id, name, input=request) as span:
             def attach(run: ar.RunHandle) -> ar.RunHandle:
                 run.config["callbacks"] = self.tracer.callbacks()
                 return run
 
-            def record(result: dict, run: ar.RunHandle) -> dict:
+            def record(result: dict, run: ar.RunHandle | None = None) -> dict:
                 if span is not None:
-                    span.update(output=result, metadata={"budget": run.budget.snapshot()})
-                    span.set_trace_io(output=result)
+                    span.update(output=result, metadata={"budget": run.budget.snapshot()} if run else None)
+                    if run is not None:  # this request moved the run: its result is the trace's latest
+                        span.set_trace_io(output=result)
                 return result
 
-            if span is not None and run_input is not None:
-                span.set_trace_io(input=run_input)
-            yield attach, record
+            if span is not None and trace_input is not None:
+                span.set_trace_io(input=trace_input)
+            try:
+                yield attach, record
+            except ServiceError as e:
+                if span is not None:
+                    span.update(output={"status_code": e.status_code, "detail": e.detail}, level="WARNING",
+                                status_message=f"rejected: {e.status_code}")
+                raise
+            except BaseException as e:
+                if span is not None:
+                    span.update(level="ERROR", status_message=f"{type(e).__name__}: {str(e)[:200]}")
+                raise
 
     @staticmethod
     def _taken_over(thread_id: str) -> ServiceError:
@@ -326,7 +341,8 @@ class Service:
         self.housekeeping()
         thread_id = str(uuid.uuid4())
         self.store.create(thread_id, alert_text, self.clock())  # epoch 1
-        with self._traced(thread_id, "served:alert", {"alert": alert_text}) as (attach, record):
+        with self._traced(thread_id, "served:alert", {"alert": alert_text}, trace_input={"alert": alert_text}) \
+                as (attach, record):
             try:
                 run = attach(self._open(thread_id, alert_text, epoch=1))
                 run.start()
@@ -335,34 +351,39 @@ class Service:
                 raise self._taken_over(thread_id) from None
 
     def approve(self, thread_id: str, approved: bool, approver: str, args_hash: str) -> dict:
-        row = self._row(thread_id)
+        row = self._row(thread_id)  # unknown runs: 404, no span (no trace for made-up ids)
         decision = {"approved": approved, "args_hash": args_hash, "approver": approver}
-
-        if row["decision"] is not None:
-            # A replay is the same approver resubmitting the same decision on
-            # the same proposal (double click, client retry): same answer, no
-            # second action. `approver` is caller-supplied for now; once there's
-            # auth it should come from the authenticated identity.
-            if row["decision"] != decision:
-                raise ServiceError(409, {"error": "This run was already decided",
-                                         "decided_by": row["decision"]["approver"],
-                                         "approved": row["decision"]["approved"]})
-            return {**self.summary(row), "replayed": True}
-        if row["status"] == "expired":
-            raise ServiceError(410, {"error": "This proposal expired before it was decided; its evidence is stale",
-                                     "proposal": row["proposal"]})
-        if row["status"] != "awaiting_approval":
-            raise ServiceError(409, "This run has no proposal waiting for approval")
-        if args_hash != row["proposal"]["args_hash"]:
-            raise ServiceError(409, {"error": "args_hash does not match the pending proposal; "
-                                              "review it and approve that one", "proposal": row["proposal"]})
-
-        # Claim it. Across threads and processes, exactly one request wins; a
-        # loser re-reads the row and gets the replay/409 answer above.
-        epoch = self.store.claim(thread_id, "awaiting_approval", "executing", self.clock(), decision=decision)
-        if epoch is None:
-            return self.approve(thread_id, approved, approver, args_hash)
-        with self._traced(thread_id, "served:approve") as (attach, record):
+        # Every approval request on a run is a span in its trace — replays,
+        # conflicts, stale hashes and expiries included: at an approval
+        # boundary, five retries or another approver's conflict are evidence.
+        with self._traced(thread_id, "served:approve", request=decision) as (attach, record):
+            for _ in range(2):  # a lost claim re-reads once: the winner's decision is stored by then
+                if row["decision"] is not None:
+                    # A replay is the same approver resubmitting the same decision on
+                    # the same proposal (double click, client retry): same answer, no
+                    # second action. `approver` is caller-supplied for now; once there's
+                    # auth it should come from the authenticated identity.
+                    if row["decision"] != decision:
+                        raise ServiceError(409, {"error": "This run was already decided",
+                                                 "decided_by": row["decision"]["approver"],
+                                                 "approved": row["decision"]["approved"]})
+                    return record({**self.summary(row), "replayed": True})
+                if row["status"] == "expired":
+                    raise ServiceError(410, {"error": "This proposal expired before it was decided; "
+                                                      "its evidence is stale", "proposal": row["proposal"]})
+                if row["status"] != "awaiting_approval":
+                    raise ServiceError(409, "This run has no proposal waiting for approval")
+                if args_hash != row["proposal"]["args_hash"]:
+                    raise ServiceError(409, {"error": "args_hash does not match the pending proposal; "
+                                                      "review it and approve that one", "proposal": row["proposal"]})
+                # Claim it. Across threads and processes, exactly one request wins.
+                epoch = self.store.claim(thread_id, "awaiting_approval", "executing", self.clock(),
+                                         decision=decision)
+                if epoch is not None:
+                    break
+                row = self._row(thread_id)
+            else:
+                raise ServiceError(409, "Another request is deciding this run")
             try:
                 run = attach(self._open(thread_id, row["alert"], epoch, self.store.get(thread_id)))
                 run.resume(approved, approver)
@@ -387,14 +408,14 @@ class Service:
                                       same idempotency key and deduplicated
         """
         row = self._row(thread_id)
-        if row["status"] != "interrupted":
-            raise ServiceError(409, f"Only an interrupted run can be recovered; this one is {row['status']}")
-        resuming = "executing" if row["decision"] else "starting"
-        epoch = self.store.claim(thread_id, "interrupted", resuming, self.clock())
-        if epoch is None:
-            raise ServiceError(409, "Another request is already recovering this run")
-        decision = row["decision"]
         with self._traced(thread_id, "served:recover") as (attach, record):
+            if row["status"] != "interrupted":
+                raise ServiceError(409, f"Only an interrupted run can be recovered; this one is {row['status']}")
+            resuming = "executing" if row["decision"] else "starting"
+            epoch = self.store.claim(thread_id, "interrupted", resuming, self.clock())
+            if epoch is None:
+                raise ServiceError(409, "Another request is already recovering this run")
+            decision = row["decision"]
             try:
                 run = attach(self._open(thread_id, row["alert"], epoch, self.store.get(thread_id)))
                 if self.checkpointer.get_tuple(run.config) is None:

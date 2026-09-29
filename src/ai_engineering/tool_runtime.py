@@ -15,10 +15,12 @@ goes through `ToolExecutor.call()`, which applies, in order:
   3. Approval (WRITE tools only): the call must carry an `Approval` for this
      exact tool, argument hash and idempotency key. Approving "rollback
      payments-api from v2.14.3" doesn't approve anything else.
-  4. Budget: every attempt is charged to the run's `RunBudget` first.
-  5. Bulkhead: each tool has its own concurrency slots, shared across runs;
-     a call finding them all taken (by hung calls) fails fast as
-     `saturated`, and other tools are unaffected.
+  4. Bulkhead: each tool has its own concurrency slots, shared across runs.
+     A slot is taken *before* the budget is charged: a call finding them all
+     taken (by hung calls) fails fast as `saturated`, uncharged, and other
+     tools are unaffected.
+  5. Budget: every attempt that got a slot is charged to the run's
+     `RunBudget` before it runs.
      Timeout + bounded retry: each attempt runs with a timeout; retryable
      failures (timeouts, connection errors, 429, 5xx) are retried with
      exponential backoff and jitter. Non-retryable ones (validation,
@@ -242,6 +244,8 @@ class ToolRegistry:
         if len(self._specs) != len(specs):
             raise ValueError("duplicate tool names")
         self.allowed = frozenset(allowed)
+        for spec in self._specs.values():
+            tool_bulkhead(spec)  # a conflicting concurrency limit fails here, not on the first call
 
     def scoped(self, *permissions: Permission) -> "ToolRegistry":
         return ToolRegistry(list(self._specs.values()), frozenset(permissions))
@@ -737,13 +741,24 @@ _BULKHEADS_LOCK = threading.Lock()
 
 
 def bulkhead(name: str, limit: int) -> Bulkhead:
-    """The process-wide bulkhead for `name`, created with `limit` on first
-    use. (Keyed by name: it models one downstream dependency, shared by every
-    run that calls it. A later spec with a different limit gets the first.)"""
+    """The process-wide bulkhead for `name` (one downstream dependency, shared
+    by every run that calls it), created with `limit` on first use. Asking
+    for it again with a different limit is a configuration error and raises:
+    a caller that configured one slot must not silently get four."""
+    if limit < 1:
+        raise ValueError(f"bulkhead {name!r}: limit must be >= 1, got {limit}")
     with _BULKHEADS_LOCK:
-        if name not in _BULKHEADS:
-            _BULKHEADS[name] = Bulkhead(name, limit)
-        return _BULKHEADS[name]
+        existing = _BULKHEADS.get(name)
+        if existing is None:
+            existing = _BULKHEADS[name] = Bulkhead(name, limit)
+        elif existing.limit != limit:
+            raise ValueError(f"bulkhead {name!r} already exists with limit {existing.limit}; "
+                             f"requested {limit}")
+        return existing
+
+
+def tool_bulkhead(spec: "ToolSpec") -> Bulkhead:
+    return bulkhead(f"tool:{spec.name}", spec.max_concurrency)
 
 
 def _validate_input(spec: ToolSpec, raw_args) -> dict:
@@ -858,7 +873,7 @@ class ToolExecutor:
         can_retry = spec.permission is Permission.READ or spec.idempotent
         policy = spec.retry if can_retry else NO_RETRY
 
-        slots = bulkhead(f"tool:{spec.name}", spec.max_concurrency)
+        slots = tool_bulkhead(spec)
 
         def attempt():
             nonlocal attempts

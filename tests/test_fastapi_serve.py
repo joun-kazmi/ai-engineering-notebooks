@@ -578,7 +578,7 @@ class RecordingTracer:
         class Span:
             def __init__(self):
                 self.record = {"trace": thread_id, "name": name, "input": input, "nodes": [],
-                               "output": None, "trace_io": {}}
+                               "output": None, "metadata": None, "level": None, "trace_io": {}}
 
             def __enter__(self):
                 tracer.spans.append(self.record)
@@ -587,8 +587,9 @@ class RecordingTracer:
             def __exit__(self, *exc):
                 return False
 
-            def update(self, output=None, metadata=None):
-                self.record["output"], self.record["metadata"] = output, metadata
+            def update(self, output=None, metadata=None, level=None, status_message=None):
+                self.record.update({k: v for k, v in (("output", output), ("metadata", metadata), ("level", level),
+                                                      ("status_message", status_message)) if v is not None})
 
             def set_trace_io(self, **io):
                 self.record["trace_io"].update(io)
@@ -628,7 +629,8 @@ def test_every_request_on_a_run_is_a_span_in_its_one_trace(db, clock, monkeypatc
 
     assert [s["name"] for s in tracer.spans] == ["served:alert", "served:approve", "served:recover"]
     assert {s["trace"] for s in tracer.spans} == {run["thread_id"]}  # one trace for the whole run
-    alert_span, _, recover_span = tracer.spans
+    alert_span, crashed_span, recover_span = tracer.spans
+    assert crashed_span["level"] == "ERROR" and crashed_span["status_message"].startswith("SimulatedCrash")
     assert alert_span["input"] == {"alert": INC["inc01"]["alert"]}
     assert {"triage", "investigate", "propose_action", "human_gate"} <= set(alert_span["nodes"])
     assert "execute" not in alert_span["nodes"] and "execute" in recover_span["nodes"]
@@ -642,3 +644,39 @@ def test_without_langfuse_there_is_no_tracing(client):
     run = alert(client)
     assert isinstance(serve.service().tracer, serve.NullTracer)
     assert get(client, run)["trace_url"] is None
+
+
+def test_replays_and_rejected_approvals_are_traced_too(db, clock):
+    tracer = RecordingTracer()
+    serve.configure(db, clock=clock, approval_ttl_s=3600, retention_s=86400, lease_s=300, tracer=tracer)
+    client = TestClient(serve.app_fastapi)
+    run = alert(client)
+    assert approve(client, run, args_hash="0" * 16).status_code == 409   # stale hash
+    assert approve(client, run).status_code == 200                       # executes
+    assert approve(client, run).json()["replayed"] is True               # same approver retries
+    assert approve(client, run, approver="bob").status_code == 409       # another approver
+    assert client.post("/approve", json={"thread_id": "nope", "approved": True, "approver": "a",
+                                         "args_hash": "x"}).status_code == 404
+    assert client.post(f"/runs/{run['thread_id']}/recover").status_code == 409  # not interrupted
+
+    spans = tracer.spans[1:]  # after served:alert
+    assert [(s["name"], s["level"]) for s in spans] == [
+        ("served:approve", "WARNING"), ("served:approve", None), ("served:approve", None),
+        ("served:approve", "WARNING"), ("served:recover", "WARNING")]  # no span for the unknown run
+    stale, executed, replay, conflict, _ = spans
+    assert stale["output"]["status_code"] == 409 and "args_hash" in stale["output"]["detail"]["error"]
+    assert executed["output"]["replayed"] is False and executed["metadata"]["budget"]
+    assert replay["output"]["replayed"] is True and replay["input"]["approver"] == "alice"
+    assert conflict["output"]["detail"]["decided_by"] == "alice" and conflict["input"]["approver"] == "bob"
+    # Only the request that moved the run set the trace's output.
+    assert [bool(s["trace_io"].get("output")) for s in spans] == [False, True, False, False, False]
+
+
+def test_expired_approval_is_traced(db, clock):
+    tracer = RecordingTracer()
+    serve.configure(db, clock=clock, approval_ttl_s=3600, retention_s=86400, lease_s=300, tracer=tracer)
+    client = TestClient(serve.app_fastapi)
+    run = alert(client)
+    clock.t += 3601
+    assert approve(client, run).status_code == 410
+    assert tracer.spans[-1]["level"] == "WARNING" and tracer.spans[-1]["output"]["status_code"] == 410
