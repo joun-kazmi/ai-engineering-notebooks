@@ -77,7 +77,7 @@ Multi-step agents on LangGraph, using incident response and support triage as th
 
 | File | What it covers |
 |---|---|
-| [`src/fastapi_serve.py`](src/fastapi_serve.py) | The hardened escalation agent served over FastAPI. `/alert` returns the proposal waiting at the approval gate. `/approve` must name that proposal's `args_hash`, and a repeated submit replays the stored result instead of acting twice. `/runs/{id}` returns the budget and the audit log. Runs are stored in SQLite: a pending approval survives a restart, an approval is claimed atomically across processes, and a run whose process crashed can be recovered without repeating a write it already made. |
+| [`src/fastapi_serve.py`](src/fastapi_serve.py) | The hardened escalation agent served over FastAPI. `/alert` returns the proposal waiting at the approval gate. `/approve` must name that proposal's `args_hash`, and a repeated submit replays the stored result instead of acting twice. `/runs/{id}` returns the budget, the audit log and the Langfuse trace. Runs are stored in SQLite: a pending approval survives a restart, an approval is claimed atomically across processes, and a run whose process crashed can be recovered without repeating a write it already made. |
 
 ---
 
@@ -247,6 +247,13 @@ Runs are durable. LangGraph's `SqliteSaver` stores the graph checkpoints. A run 
   - **Anywhere else:** it continues from the last checkpoint. A write it had already made is re-sent with the same idempotency key and deduplicated, so nothing happens twice.
 - **A worker presumed dead can't overwrite a recovered run.** Every claim, recovery and stale-marking bumps the run's epoch, and every write requires the current epoch. That covers run state, audit records and LangGraph checkpoints. A stalled worker that wakes up after its run was recovered fails on its next write and stops. (With a real backend, the epoch would also be sent to it as a fencing token.)
 - **Checkpoints are written synchronously** (`durability="sync"`), so a crash can't lose a finished step. They are also **deserialized strictly**, so a tampered database can't make the service construct arbitrary Python objects.
+- **A hung tool can't take the others down.** Each tool has its own concurrency slots (`ToolSpec.max_concurrency`, default 4), shared by all runs in the process. Configuring the same tool with a different limit elsewhere is an error rather than silently getting the first limit. A timed-out call keeps its slot until it actually returns. So a tool that hangs forever ties up at most its own slots, and the next call to it fails fast as `saturated`: it doesn't run, isn't charged, and counts toward the circuit breaker. Every other tool keeps working. LLM calls have their own slots (32 by default); saturation there is retried with backoff, within the run's budget.
+- **One Langfuse trace per run.** With `LANGFUSE_*` set, the trace id is derived from the run's `thread_id`. So every `/alert`, `/approve` and `/recover` request on a run adds a span to the same trace, even from different processes:
+  - requests that execute hold their LangGraph node tree and LLM generations;
+  - replays are recorded with their result;
+  - rejections (another approver, a stale `args_hash`, an expired proposal, a run with nothing to recover) are recorded as `WARNING`, and crashes as `ERROR`.
+
+  Requests for unknown runs aren't traced. `GET /runs/{id}` returns the `trace_url`.
 
 To run the offline smoke tests (no API keys or LLM calls; the same suite runs in CI):
 

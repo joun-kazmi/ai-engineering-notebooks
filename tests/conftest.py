@@ -22,3 +22,18 @@ os.environ["LLM_PROVIDER"] = "nvidia"
 import tempfile
 
 os.environ["SERVE_DB_PATH"] = str(Path(tempfile.mkdtemp(prefix="serve-tests-")) / "serve.sqlite3")
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def fresh_bulkheads():
+    """Bulkheads are process-wide by design (one per downstream tool), so a
+    test that leaves deliberately hung calls behind would saturate the next
+    test's tool of the same name. Each test starts with its own."""
+    from ai_engineering import tool_runtime
+
+    tool_runtime._BULKHEADS.clear()
+    yield
+    tool_runtime._BULKHEADS.clear()

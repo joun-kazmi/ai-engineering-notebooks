@@ -15,8 +15,13 @@ goes through `ToolExecutor.call()`, which applies, in order:
   3. Approval (WRITE tools only): the call must carry an `Approval` for this
      exact tool, argument hash and idempotency key. Approving "rollback
      payments-api from v2.14.3" doesn't approve anything else.
-  4. Budget: every attempt is charged to the run's `RunBudget` first.
-  5. Timeout + bounded retry: each attempt runs with a timeout; retryable
+  4. Bulkhead: each tool has its own concurrency slots, shared across runs.
+     A slot is taken *before* the budget is charged: a call finding them all
+     taken (by hung calls) fails fast as `saturated`, uncharged, and other
+     tools are unaffected.
+  5. Budget: every attempt that got a slot is charged to the run's
+     `RunBudget` before it runs.
+     Timeout + bounded retry: each attempt runs with a timeout; retryable
      failures (timeouts, connection errors, 429, 5xx) are retried with
      exponential backoff and jitter. Non-retryable ones (validation,
      permission, 4xx, budget) fail immediately.
@@ -39,9 +44,10 @@ write that times out is reported as `timeout` and left for a human.
 import contextvars
 import hashlib
 import json
+import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -87,6 +93,18 @@ class InvalidToolOutput(ToolError):
 
 class PermissionDenied(ToolError):
     outcome = "denied"
+
+
+class ToolSaturated(ToolError):
+    """Every concurrency slot of this tool is taken — typically by calls that
+    timed out and are still hanging. Fails fast (nothing runs, nothing is
+    charged): another attempt now would only queue behind the hung ones."""
+    outcome = "saturated"
+
+
+class LLMSaturated(TransientToolError):
+    """Every LLM slot is taken. Unlike a tool's, usually just load: retried
+    with backoff, within the run's budget."""
 
 
 class CircuitOpen(ToolError):
@@ -181,6 +199,9 @@ class ToolSpec:
     retry: RetryPolicy = RetryPolicy()
     idempotent: bool = False
     retryable: Callable[[BaseException], bool] | None = None
+    # Concurrent executions of this tool across every run in the process,
+    # timed-out ones included until they actually return (see Bulkhead).
+    max_concurrency: int = 4
 
     def classify(self, exc: BaseException) -> bool:
         if self.retryable is not None:
@@ -223,6 +244,8 @@ class ToolRegistry:
         if len(self._specs) != len(specs):
             raise ValueError("duplicate tool names")
         self.allowed = frozenset(allowed)
+        for spec in self._specs.values():
+            tool_bulkhead(spec)  # a conflicting concurrency limit fails here, not on the first call
 
     def scoped(self, *permissions: Permission) -> "ToolRegistry":
         return ToolRegistry(list(self._specs.values()), frozenset(permissions))
@@ -526,13 +549,14 @@ class BudgetedChatClient:
 
     def __init__(self, client, budget: RunBudget, call_timeout_s: float = 60.0,
                  retry: RetryPolicy = RetryPolicy(max_attempts=10, initial_s=2.0, max_s=60.0, jitter_s=2.0),
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep, max_concurrency: int = 32):
         self._client = client
         self.budget = budget
         self.call_timeout_s = call_timeout_s
         self.retry = retry
         self.retried: dict[str, int] = {}
         self._sleep = sleep
+        self._slots = bulkhead("llm", max_concurrency)
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def _deadline_exceeded(self, extra_s: float = 0.0) -> BudgetExceeded:
@@ -540,14 +564,20 @@ class BudgetedChatClient:
         return BudgetExceeded("time_s", round(self.budget.elapsed_s + extra_s, 1), self.budget.limits.max_seconds)
 
     def _attempt(self, kwargs: dict):
-        self.budget.charge_llm_call()
-        remaining = self.budget.remaining_s()
-        timeout = self.call_timeout_s if remaining is None else min(self.call_timeout_s, remaining)
-        if timeout <= 0:
-            raise self._deadline_exceeded()
+        if not self._slots.try_reserve():
+            raise LLMSaturated(f"all {self._slots.limit} LLM slots are taken")
+        try:
+            self.budget.charge_llm_call()
+            remaining = self.budget.remaining_s()
+            timeout = self.call_timeout_s if remaining is None else min(self.call_timeout_s, remaining)
+            if timeout <= 0:
+                raise self._deadline_exceeded()
+        except BaseException:
+            self._slots.cancel()
+            raise
         # copy_context: tracing (Langfuse/OpenTelemetry) keeps its parent span on the worker thread.
-        future = _LLM_POOL.submit(contextvars.copy_context().run, self._client.chat.completions.create,
-                                  **{**kwargs, "timeout": timeout})
+        future = self._slots.run(contextvars.copy_context().run, self._client.chat.completions.create,
+                                 **{**kwargs, "timeout": timeout})
         try:
             return future.result(timeout=timeout)
         except FutureTimeout:
@@ -564,7 +594,8 @@ class BudgetedChatClient:
                 if not is_retryable(e):
                     raise
                 timed_out = isinstance(e, (TimeoutError, ToolTimeout)) or "Timeout" in type(e).__name__
-                key = str(getattr(e, "status_code", None) or ("timeout" if timed_out else "connection"))
+                key = ("saturated" if isinstance(e, LLMSaturated) else
+                       str(getattr(e, "status_code", None) or ("timeout" if timed_out else "connection")))
                 self.retried[key] = self.retried.get(key, 0) + 1
                 if attempt == self.retry.max_attempts:
                     raise LLMUnavailable(f"{type(e).__name__} after {attempt} attempts: {str(e)[:200]}") from e
@@ -652,14 +683,82 @@ class ToolResult:
         return self.output if self.ok else {"error": self.error}
 
 
-# Worker pools for timeouts. A timed-out attempt can't be killed and keeps
-# its worker until it returns. That's fine for a notebook or a batch eval,
-# where a stuck call eventually hits its own network timeout. In a
-# long-lived service, a tool that hangs *forever* leaks one worker per call
-# until the pool is exhausted and every tool call queues behind it — use
-# per-tool concurrency limits, or async tools with real cancellation, there.
-_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="tool")
-_LLM_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm")
+class Bulkhead:
+    """Concurrency slots for one tool (or for LLM calls), shared by every
+    run in the process.
+
+    Attempts run on worker threads so they can be timed out, but a Python
+    thread can't be killed: a timed-out attempt keeps running until it
+    returns. With one shared pool, a tool that hangs *forever* would leak a
+    worker per call until the pool was exhausted and every tool queued
+    behind it. Here each tool has its own pool of `limit` workers, and a
+    slot is held until the attempt actually finishes — timed out or not. So
+    a hung tool can tie up at most `limit` threads, a call that finds all of
+    them taken fails fast instead of queueing, and other tools are
+    untouched.
+
+    Use: `try_reserve()` a slot (False = saturated), then either `run()` on
+    it — the slot frees when the call returns — or `cancel()` it."""
+
+    def __init__(self, name: str, limit: int):
+        self.name, self.limit = name, limit
+        self._slots = threading.BoundedSemaphore(limit)
+        self._pool = ThreadPoolExecutor(max_workers=limit, thread_name_prefix=f"bulkhead-{name}")
+        self._busy = 0
+        self._lock = threading.Lock()
+
+    @property
+    def in_flight(self) -> int:
+        """Slots taken: reserved or running, hung calls included."""
+        with self._lock:
+            return self._busy
+
+    def try_reserve(self) -> bool:
+        if not self._slots.acquire(blocking=False):
+            return False
+        with self._lock:
+            self._busy += 1
+        return True
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._busy -= 1
+        self._slots.release()
+
+    def run(self, fn, *args, **kwargs) -> Future:
+        """Run on a reserved slot; the slot is freed when `fn` returns."""
+        try:
+            future = self._pool.submit(fn, *args, **kwargs)
+        except BaseException:
+            self.cancel()
+            raise
+        future.add_done_callback(lambda _: self.cancel())
+        return future
+
+
+_BULKHEADS: dict[str, Bulkhead] = {}
+_BULKHEADS_LOCK = threading.Lock()
+
+
+def bulkhead(name: str, limit: int) -> Bulkhead:
+    """The process-wide bulkhead for `name` (one downstream dependency, shared
+    by every run that calls it), created with `limit` on first use. Asking
+    for it again with a different limit is a configuration error and raises:
+    a caller that configured one slot must not silently get four."""
+    if limit < 1:
+        raise ValueError(f"bulkhead {name!r}: limit must be >= 1, got {limit}")
+    with _BULKHEADS_LOCK:
+        existing = _BULKHEADS.get(name)
+        if existing is None:
+            existing = _BULKHEADS[name] = Bulkhead(name, limit)
+        elif existing.limit != limit:
+            raise ValueError(f"bulkhead {name!r} already exists with limit {existing.limit}; "
+                             f"requested {limit}")
+        return existing
+
+
+def tool_bulkhead(spec: "ToolSpec") -> Bulkhead:
+    return bulkhead(f"tool:{spec.name}", spec.max_concurrency)
 
 
 def _validate_input(spec: ToolSpec, raw_args) -> dict:
@@ -749,7 +848,7 @@ class ToolExecutor:
             ok = outcome in ("ok", "deduplicated")
             if ok:
                 self.failures[name] = 0
-            elif outcome in ("failed", "timeout", "invalid_output"):
+            elif outcome in ("failed", "timeout", "invalid_output", "saturated"):
                 self.failures[name] = self.failures.get(name, 0) + 1
             if self.on_finish is not None:
                 self.on_finish(self)
@@ -774,11 +873,21 @@ class ToolExecutor:
         can_retry = spec.permission is Permission.READ or spec.idempotent
         policy = spec.retry if can_retry else NO_RETRY
 
+        slots = tool_bulkhead(spec)
+
         def attempt():
             nonlocal attempts
-            self.budget.charge_tool_call()  # BudgetExceeded is non-retryable: stops the loop
+            # A slot first: a saturated tool fails fast, without being charged.
+            if not slots.try_reserve():
+                raise ToolSaturated(f"{spec.name}: all {slots.limit} concurrency slots are taken "
+                                    f"(calls still running or hung); not queueing behind them")
+            try:
+                self.budget.charge_tool_call()  # BudgetExceeded is non-retryable: stops the loop
+            except BaseException:
+                slots.cancel()
+                raise
             attempts += 1
-            return self._run_with_timeout(spec, args, ctx)
+            return self._run_with_timeout(spec, args, ctx, slots)
 
         retrying = Retrying(
             stop=stop_after_attempt(policy.max_attempts),
@@ -812,12 +921,12 @@ class ToolExecutor:
         if not approval.approved:
             raise PermissionDenied(f"rejected by {approval.approver} (approval {approval.approval_id})")
 
-    def _run_with_timeout(self, spec: ToolSpec, args: dict, ctx: ToolContext):
+    def _run_with_timeout(self, spec: ToolSpec, args: dict, ctx: ToolContext, slots: Bulkhead):
         timeout = spec.timeout_s
         remaining = self.budget.remaining_s()
         if remaining is not None:
             timeout = min(timeout, remaining)
-        future = _POOL.submit(spec.fn, spec.input_model.model_validate(args), ctx)
+        future = slots.run(spec.fn, spec.input_model.model_validate(args), ctx)
         try:
             return future.result(timeout=timeout)
         except FutureTimeout:
