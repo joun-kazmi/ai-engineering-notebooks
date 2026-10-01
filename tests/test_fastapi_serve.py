@@ -104,6 +104,15 @@ def test_alert_returns_the_validated_proposal(client):
     assert not side_effects(client, run)  # nothing happens before approval
 
 
+def test_the_approval_surface_is_code_checked_facts_not_model_prose(client):
+    run = alert(client)
+    assert "root_cause" not in run
+    assert run["proposal"]["evidence"] == [
+        {"source": "get_metrics", "fact": "error rate 31.0%, p95 900 ms (SLO 800 ms), 6/6 replicas healthy"},
+        {"source": "get_recent_deploys", "fact": "v2.14.3 deployed 9 minutes ago"}]
+    assert get(client, run)["proposal"] == run["proposal"]
+
+
 def test_approval_executes_exactly_the_proposal(client):
     run = alert(client)
     resp = approve(client, run)

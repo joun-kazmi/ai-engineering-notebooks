@@ -55,8 +55,7 @@ CREATE TABLE IF NOT EXISTS runs (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     expires_at REAL,            -- awaiting_approval only: when the proposal goes stale
-    proposal   TEXT,            -- the proposal at the approval gate
-    root_cause TEXT,
+    proposal   TEXT,            -- the proposal at the approval gate: the call and its checked evidence
     decision   TEXT,            -- {"approved", "args_hash", "approver"}, set when claimed
     response   TEXT,            -- the summary returned once the run settles
     budget     TEXT,            -- RunBudget.to_dict()

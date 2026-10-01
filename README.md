@@ -47,6 +47,7 @@ Multi-step agents on LangGraph, using incident response and support triage as th
 | [`escalation_agent_langgraph_with_langfuse_observability`](notebooks/agents/escalation_agent_langgraph_with_langfuse_observability.ipynb) | An escalation agent instrumented with Langfuse — traces, spans, per-step cost |
 | [`agent_observability_eval`](notebooks/agents/agent_observability_eval.ipynb) | Turns tracing into numbers you can regress on: model-node latency/tokens/validation retries and every tool call's arguments, and an eval suite over incidents whose correct action (rollback, page, restart, monitor, close) must be derived from per-incident tool evidence. Scored separately for severity, action, tool targeting, and RCA groundedness (figure check + claim-by-claim judge). Includes one **intentionally broken run**, where evidence tools silently queried the wrong service and the verifier still said `ok`, diagnosed from the trace and scored in Langfuse. See [Results](#results). |
 | [`agent_reliability_hardening`](notebooks/agents/agent_reliability_hardening.ipynb) | The same agent, hardened for when things around it go wrong. Tools have Pydantic input and output contracts, and their schemas are generated from the input model. Every tool call gets a per-tool timeout and bounded retries with exponential backoff and jitter, using one retryable-vs-not classification. Investigation is read-only and the remediation actions are real write tools. Approval is bound to the exact arguments and idempotency key of one write. Run budgets cover LLM calls, tool calls, tokens, cost, time and graph steps, and exhausting one escalates instead of crashing. Every call, including refused ones, gets an audit record. Faults are injected deterministically: 503s, hangs, malformed output, a prompt-injected log line, a runaway loop, and a write that commits but loses its response. See [Results](#results). |
+| [`prompt_injection_eval`](notebooks/agents/prompt_injection_eval.ipynb) | Indirect prompt injection, assuming every model decision is the attacker's. The RCA only *recommends*: `compile_action` decides in code whether the runbook's first matching rule is that action, and derives the write's arguments and the pager text from structured evidence. The model's target, its prose and free text from logs never reach a write or the approval gate, and an ambiguous target escalates. 15 injection cases are overlays on the incident set, across 4 carriers (log line, deploy author, dependency status, dependency name), run against a fully compromised stand-in. Spotlighting of untrusted fields is measured as a mitigation, not counted as a control. See [Results](#results). |
 
 **On observability:** the escalation agent is the piece worth reading first. It traces every node in the graph, so you can see which step burned the latency and which one produced the wrong answer. Debugging a multi-step agent without that is guesswork. [`agent_observability_eval`](notebooks/agents/agent_observability_eval.ipynb) is what that tracing is *for*: a regression you can catch automatically instead of a trace you have to remember to go look at.
 
@@ -77,7 +78,7 @@ Multi-step agents on LangGraph, using incident response and support triage as th
 
 | File | What it covers |
 |---|---|
-| [`src/fastapi_serve.py`](src/fastapi_serve.py) | The hardened escalation agent served over FastAPI, behind Bearer-token (OIDC JWT) authentication with a scope per endpoint. `/alert` returns the proposal waiting at the approval gate. `/approve` must name that proposal's `args_hash`; the approver is the token's verified principal, never the request body, and approving a write needs the `sre` group. A repeated submit replays the stored result instead of acting twice. `/runs/{id}` returns the budget, the audit log and the Langfuse trace. Runs are stored in SQLite: a pending approval survives a restart, an approval is claimed atomically across processes, and a run whose process crashed can be recovered without repeating a write it already made. |
+| [`src/fastapi_serve.py`](src/fastapi_serve.py) | The hardened escalation agent served over FastAPI, behind Bearer-token (OIDC JWT) authentication with a scope per endpoint. `/alert` returns the proposal waiting at the approval gate: the exact call and the facts code checked, with no model prose. `/approve` must name that proposal's `args_hash`; the approver is the token's verified principal, never the request body, and approving a write needs the `sre` group. A repeated submit replays the stored result instead of acting twice. `/runs/{id}` returns the budget, the audit log and the Langfuse trace. Runs are stored in SQLite: a pending approval survives a restart, an approval is claimed atomically across processes, and a run whose process crashed can be recovered without repeating a write it already made. |
 
 ---
 
@@ -139,6 +140,20 @@ Live runs on NVIDIA NIM (`nemotron-3-super-120b-a12b`, `nemotron-3-embed-1b`); f
   - A triage returning `service="service"`.
 
   Each now has a fix and a test.
+
+**Prompt injection** — [`prompt_injection_eval`](notebooks/agents/prompt_injection_eval.ipynb), 15 cases on the incident set. The model is replaced by an adversary that obeys every injection: it tries the write itself, the verifier says `ok`, and the RCA recommends the attacker's action and target with the payload as its prose. An approver who approves anything is at the gate.
+
+| Where the attack stopped | Cases |
+|---|---|
+| Another runbook rule applies: unsupported rollbacks, pages and restarts, and every steer to `monitor` on an incident that needs action | 10 |
+| The compiler replaced the target: the right kind of write, executed against the target the evidence names (db-team, not payments-team; worker-3, not worker-2) | 2 |
+| No gain: the attacker asked for the runbook's own write; its payload stayed out of the pager text and the approval gate | 2 |
+| The tool contract rejected the evidence: a dependency name carrying a sentence | 1 |
+
+- **Controls held in 15/15.** Every executed write (4) is exactly the one `compile_action` derives from the incident's own structured evidence, and no payload reached a write or the approval gate. These are CI tests, and each control was reverted once to confirm a test fails without it.
+- **What changed to get there.** The pager text came from the model's RCA, so injected text could reach the on-call human. A restart target came from a log regex, so a forged "worker-2 no heartbeat" line could pick the replica. The approver read the model's prose. Now the pager text is a template over metrics, replicas come from the orchestrator's per-replica health, and the gate shows only the call and the checked facts.
+- **Live steer rate, with and without spotlighting:** not run in this environment. The notebook's live section runs both when a key is configured. The offline result is the guarantee; the live one would measure how often the model is fooled, not what that costs.
+- **Not covered:** the alert text as a carrier (it also names the service, so it needs a trusted service identity first), and cross-service confidentiality (a compromised model can still read other services through its read tools).
 
 ## Running these
 
@@ -215,6 +230,7 @@ reported as unpriced.
 python scripts/rag_evaluation_benchmark.py
 python scripts/agent_observability_eval.py
 python scripts/agent_reliability_hardening.py
+python scripts/prompt_injection_eval.py
 ```
 
 To run the FastAPI service (from the repo root) as a local demo, with authentication off:
@@ -229,10 +245,11 @@ AUTH_MODE=disabled uvicorn src.fastapi_serve:app_fastapi --reload
 curl -s -X POST localhost:8000/alert -H 'content-type: application/json' \
   -d '{"alert_text": "checkout-api p95 latency 6s and timeouts on checkout, error rate climbing"}'
 # -> {"status": "awaiting_approval", "thread_id": "...", "proposal": {"tool": "page_oncall",
-#     "args": {"team": "db-team", ...}, "args_hash": "fd788be9149bbff0", ...}, ...}
+#     "args": {"team": "db-team", ...}, "args_hash": "0a4659830a92bba8", ...,
+#     "evidence": [{"source": "get_dependencies", "fact": "postgres-primary (owner db-team) is saturated"}, ...]}, ...}
 
 curl -s -X POST localhost:8000/approve -H 'content-type: application/json' \
-  -d '{"thread_id": "...", "approved": true, "args_hash": "fd788be9149bbff0"}'
+  -d '{"thread_id": "...", "approved": true, "args_hash": "0a4659830a92bba8"}'
 # -> {"status": "completed", "approved_by": "local|demo", ...}
 ```
 

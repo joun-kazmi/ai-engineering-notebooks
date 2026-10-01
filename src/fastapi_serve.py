@@ -9,8 +9,9 @@ needs a Bearer token with its scope (FastAPI's own /docs, /redoc and
 /openapi.json are not behind it):
 
   POST /alert                alerts:create. Start a run; returns the proposal
-                             waiting at the approval gate (tool, validated
-                             args, args_hash, idempotency key), or the outcome
+                             waiting at the approval gate (tool, args,
+                             args_hash, idempotency key, and the evidence
+                             code checked — no model prose), or the outcome
                              if none is needed.
   POST /approve              runs:approve. Decide on that proposal. `args_hash`
                              must name the proposal the approver reviewed, or
@@ -274,8 +275,9 @@ class Service:
         now = self.clock()
         proposal = run.pending_proposal
         if proposal is not None:
+            # The proposal carries the exact call and the facts code checked
+            # (compile_action); the model's RCA prose is not part of it.
             self.store.settle(thread_id, epoch, from_status, "awaiting_approval", now, proposal=proposal,
-                              root_cause=(run.state.get("report") or {}).get("root_cause"),
                               expires_at=now + self.approval_ttl_s)
         else:
             state = run.state
@@ -309,7 +311,7 @@ class Service:
         status, thread_id = row["status"], row["thread_id"]
         if status == "awaiting_approval":
             return {"status": status, "thread_id": thread_id, "proposal": row["proposal"],
-                    "root_cause": row["root_cause"], "expires_at": row["expires_at"]}
+                    "expires_at": row["expires_at"]}
         if status in ("completed", "escalated"):
             return row["response"]
         if status == "expired":
