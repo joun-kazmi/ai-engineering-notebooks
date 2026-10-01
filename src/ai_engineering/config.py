@@ -117,8 +117,8 @@ class Settings(BaseSettings):
 
     # Authentication for the served agent (ai_engineering.auth). `oidc`
     # verifies Bearer JWTs from AUTH_ISSUER for AUTH_AUDIENCE against the
-    # issuer's JWKS; without all three the service refuses every request.
-    # `disabled` is for local demos only: every request is one local
+    # issuer's JWKS; without all three it refuses every agent API request.
+    # `disabled` is for local demos only: every agent API request is one local
     # principal with every scope.
     auth_mode: Literal["oidc", "disabled"] = "oidc"
     auth_issuer: str | None = None

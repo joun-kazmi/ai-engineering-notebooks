@@ -4,8 +4,9 @@ Every alert runs the hardened graph from ai_engineering.agent_reliability:
 Pydantic tool contracts, timeouts and bounded retries, read-only
 investigation, evidence-checked actions, run budgets and an audit record per
 tool call. The service adds the parts that only exist when a human answers
-over HTTP, and keeps runs durable across restarts. Every endpoint needs a
-Bearer token with its scope:
+over HTTP, and keeps runs durable across restarts. Every agent API endpoint
+needs a Bearer token with its scope (FastAPI's own /docs, /redoc and
+/openapi.json are not behind it):
 
   POST /alert                alerts:create. Start a run; returns the proposal
                              waiting at the approval gate (tool, validated
@@ -518,14 +519,14 @@ def configure_auth(verifier: TokenVerifier | None = None, policy: ApprovalPolicy
                    mode: str | None = None) -> AuthConfig:
     """(Re)create the auth config: a given verifier and policy (tests), or
     one built from AUTH_* settings. With AUTH_MODE=oidc (the default) a
-    missing issuer, audience or JWKS URL raises, and every request is refused
+    missing issuer, audience or JWKS URL raises, and every agent API request is refused
     until it's fixed."""
     global _auth
     s = get_settings()
     mode = mode or ("oidc" if verifier is not None else s.auth_mode)
     policy = policy or SreApprovalPolicy(s.auth_approver_group)
     if mode == "disabled":
-        log.warning("AUTH_MODE=disabled: authentication is OFF. Every request is %r with every scope "
+        log.warning("AUTH_MODE=disabled: authentication is OFF. Every agent API request is %r with every scope "
                     "and group %r. Use only for local demos.", LOCAL_PRINCIPAL, s.auth_approver_group)
         _auth = AuthConfig(mode, None, policy, Identity(LOCAL_PRINCIPAL, SCOPES,
                                                         frozenset({s.auth_approver_group})))
