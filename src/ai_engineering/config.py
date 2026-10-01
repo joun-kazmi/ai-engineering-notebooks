@@ -115,6 +115,20 @@ class Settings(BaseSettings):
     run_retention_s: float = 7 * 24 * 3600
     run_lease_s: float = 300
 
+    # Authentication for the served agent (ai_engineering.auth). `oidc`
+    # verifies Bearer JWTs from AUTH_ISSUER for AUTH_AUDIENCE against the
+    # issuer's JWKS; without all three it refuses every agent API request.
+    # `disabled` is for local demos only: every agent API request is one local
+    # principal with every scope.
+    auth_mode: Literal["oidc", "disabled"] = "oidc"
+    auth_issuer: str | None = None
+    auth_audience: str | None = None
+    auth_jwks_url: str | None = None
+    auth_algorithms: str = "RS256,ES256"
+    auth_scope_claim: str = "scope"
+    auth_groups_claim: str = "groups"
+    auth_approver_group: str = "sre"
+
     langfuse_public_key: SecretStr | None = None
     langfuse_secret_key: SecretStr | None = None
     langfuse_base_url: str = "https://cloud.langfuse.com"
@@ -124,6 +138,7 @@ class Settings(BaseSettings):
         "llm_usd_per_mtok_in", "llm_usd_per_mtok_out",
         "nvidia_api_key", "openai_api_key",
         "langfuse_public_key", "langfuse_secret_key",
+        "auth_issuer", "auth_audience", "auth_jwks_url",
         mode="before",
     )
     @classmethod
@@ -134,7 +149,9 @@ class Settings(BaseSettings):
             return None
         return v
 
-    @field_validator("serve_db_path", "approval_ttl_s", "run_retention_s", "run_lease_s", mode="before")
+    @field_validator("serve_db_path", "approval_ttl_s", "run_retention_s", "run_lease_s",
+                     "auth_mode", "auth_algorithms", "auth_scope_claim", "auth_groups_claim",
+                     "auth_approver_group", mode="before")
     @classmethod
     def _blank_is_default(cls, v):
         # Same idea for settings that have a default rather than meaning "off".
@@ -184,6 +201,10 @@ class Settings(BaseSettings):
     def resolved_serve_db_path(self) -> Path:
         path = Path(self.serve_db_path)
         return path if path.is_absolute() else _REPO_ROOT / path
+
+    @property
+    def resolved_auth_algorithms(self) -> tuple[str, ...]:
+        return tuple(a.strip() for a in self.auth_algorithms.split(",") if a.strip())
 
     @property
     def langfuse_configured(self) -> bool:

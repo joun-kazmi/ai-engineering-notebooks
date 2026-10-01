@@ -56,3 +56,20 @@ def test_rate_limiter_spaces_requests_and_records_wait(monkeypatch):
         lim.wait()
     assert sleeps == [1.0, 2.0]  # back-to-back calls queue up one interval apart
     assert lim.waited == 3.0
+
+
+def test_blank_auth_settings_mean_the_defaults(monkeypatch):
+    for name in ("AUTH_MODE", "AUTH_ISSUER", "AUTH_AUDIENCE", "AUTH_JWKS_URL", "AUTH_ALGORITHMS",
+                 "AUTH_SCOPE_CLAIM", "AUTH_GROUPS_CLAIM", "AUTH_APPROVER_GROUP"):
+        monkeypatch.setenv(name, " ")
+    s = Settings(_env_file=None)
+    assert s.auth_mode == "oidc"  # fails closed unless issuer, audience and JWKS URL are set
+    assert (s.auth_issuer, s.auth_audience, s.auth_jwks_url) == (None, None, None)
+    assert s.resolved_auth_algorithms == ("RS256", "ES256")
+    assert (s.auth_scope_claim, s.auth_groups_claim, s.auth_approver_group) == ("scope", "groups", "sre")
+
+    monkeypatch.setenv("AUTH_ALGORITHMS", "ES256, RS256")
+    assert Settings(_env_file=None).resolved_auth_algorithms == ("ES256", "RS256")
+    monkeypatch.setenv("AUTH_MODE", "off")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)

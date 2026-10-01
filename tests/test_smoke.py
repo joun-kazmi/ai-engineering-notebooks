@@ -115,15 +115,21 @@ def test_readme_serve_command_targets_the_fastapi_app(serve):
 
 def test_service_exposes_expected_routes(serve):
     paths = {r.path for r in serve.app_fastapi.routes}
-    assert {"/generate", "/alert", "/approve", "/runs/{thread_id}", "/runs/{thread_id}/recover"} <= paths
+    assert {"/alert", "/approve", "/runs/{thread_id}", "/runs/{thread_id}/recover"} <= paths
+    assert "/generate" not in paths  # unauthenticated, unbudgeted LLM proxy: removed
 
 
 def test_approve_unknown_thread_returns_404(serve):
     from fastapi.testclient import TestClient
+    from jwt_helpers import as_user, configure_test_auth
 
-    resp = TestClient(serve.app_fastapi).post(
-        "/approve", json={"thread_id": "does-not-exist", "approved": True, "approver": "ci", "args_hash": "x"}
-    )
+    configure_test_auth(serve)
+    try:
+        resp = TestClient(serve.app_fastapi).post(
+            "/approve", headers=as_user("ci"), json={"thread_id": "does-not-exist", "approved": True, "args_hash": "x"}
+        )
+    finally:
+        serve.reset_auth()
     assert resp.status_code == 404
 
 

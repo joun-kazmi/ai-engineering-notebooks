@@ -4,6 +4,8 @@ conftest.py blanks every API key, so the hardened graph runs with the
 rule-based stand-ins; the HTTP contract around the approval gate and the
 durability of runs are what's under test here. A "restart" is a new Service
 on the same SQLite file; "two processes" are two Services sharing one.
+Requests carry tokens signed with a test key (jwt_helpers); what the tokens
+themselves may and may not do is tested in test_auth.py.
 """
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -15,8 +17,14 @@ import ai_engineering.agent_eval as ae
 import ai_engineering.agent_reliability as ar
 import src.fastapi_serve as serve
 from ai_engineering.tool_runtime import RunBudget, ToolExecutor
+from jwt_helpers import as_user, configure_test_auth, principal
 
 INC = {i["id"]: i for i in ae.load_incidents()}
+ALICE = principal("alice")
+
+
+def allow(proposal, approved):
+    """The approval policy for direct Service calls: anyone may decide."""
 
 
 class Clock:
@@ -42,10 +50,22 @@ def restart(db, clock):
     return serve.configure(db, clock=clock, approval_ttl_s=3600, retention_s=86400, lease_s=300)
 
 
+@pytest.fixture(autouse=True)
+def auth():
+    configure_test_auth(serve)
+    yield
+    serve.reset_auth()
+
+
+def http_client():
+    """Requests as alice, an SRE with every scope, unless a test says otherwise."""
+    return TestClient(serve.app_fastapi, headers=as_user("alice"))
+
+
 @pytest.fixture
 def client(db, clock):
     restart(db, clock)
-    return TestClient(serve.app_fastapi)
+    return http_client()
 
 
 def alert(client, inc_id="inc01"):
@@ -55,8 +75,8 @@ def alert(client, inc_id="inc01"):
 
 
 def approve(client, run, approved=True, approver="alice", args_hash=None):
-    return client.post("/approve", json={
-        "thread_id": run["thread_id"], "approved": approved, "approver": approver,
+    return client.post("/approve", headers=as_user(approver), json={
+        "thread_id": run["thread_id"], "approved": approved,
         "args_hash": args_hash or run["proposal"]["args_hash"]})
 
 
@@ -89,11 +109,11 @@ def test_approval_executes_exactly_the_proposal(client):
     resp = approve(client, run)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "completed" and body["replayed"] is False and body["approved_by"] == "alice"
+    assert body["status"] == "completed" and body["replayed"] is False and body["approved_by"] == ALICE
     assert "v2.14.3 -> v2.14.2" in body["outcome"]
     [write] = [r for r in get(client, run)["audit"] if r["permission"] == "write"]
     assert write["args"] == run["proposal"]["args"]
-    assert write["approval"]["approver"] == "alice"
+    assert write["approval"]["approver"] == ALICE
     assert write["approval"]["args_hash"] == run["proposal"]["args_hash"]
 
 
@@ -119,7 +139,7 @@ def test_a_different_second_decision_is_refused(client):
     run = alert(client)
     approve(client, run, approved=False)
     resp = approve(client, run, approved=True)
-    assert resp.status_code == 409 and resp.json()["detail"]["decided_by"] == "alice"
+    assert resp.status_code == 409 and resp.json()["detail"]["decided_by"] == ALICE
     assert not side_effects(client, run)
 
 
@@ -128,7 +148,7 @@ def test_another_approver_is_not_a_replay(client):
     assert approve(client, run, approver="alice").json()["replayed"] is False
     bob = approve(client, run, approver="bob")
     assert bob.status_code == 409 and bob.json()["detail"] == {
-        "error": "This run was already decided", "decided_by": "alice", "approved": True}
+        "error": "This run was already decided", "decided_by": ALICE, "approved": True}
     assert approve(client, run, approver="alice").json()["replayed"] is True  # alice retrying is
     assert len(side_effects(client, run)) == 1
 
@@ -145,15 +165,14 @@ def test_concurrent_approvals_act_once(client):
 def test_rejection_escalates_with_no_write(client):
     run = alert(client)
     body = approve(client, run, approved=False, approver="sre-lead").json()
-    assert body["status"] == "escalated" and body["outcome"] == "Escalated to a human: rejected by sre-lead"
+    assert body["status"] == "escalated" and body["outcome"] == f"Escalated to a human: rejected by {principal('sre-lead')}"
     assert body["approved_by"] is None and not side_effects(client, run)
 
 
 def test_sev3_alert_closes_after_a_metrics_check_and_has_nothing_to_approve(client):
     run = alert(client, "inc03")
     assert run["status"] == "completed" and "metrics confirm no impact" in run["outcome"]
-    resp = client.post("/approve", json={"thread_id": run["thread_id"], "approved": True,
-                                         "approver": "alice", "args_hash": "x"})
+    resp = client.post("/approve", json={"thread_id": run["thread_id"], "approved": True, "args_hash": "x"})
     assert resp.status_code == 409 and "no proposal waiting" in resp.json()["detail"]
 
 
@@ -176,12 +195,8 @@ def test_run_endpoint_reports_budget_and_audit(client):
 
 def test_approval_payload_requires_the_args_hash(client):
     run = alert(client)
-    resp = client.post("/approve", json={"thread_id": run["thread_id"], "approved": True, "approver": "alice"})
+    resp = client.post("/approve", json={"thread_id": run["thread_id"], "approved": True})
     assert resp.status_code == 422
-
-
-def test_generate_without_a_key_is_503(client):
-    assert client.post("/generate", json={"prompt": "hi"}).status_code == 503
 
 
 # ---- the run lifecycle
@@ -258,7 +273,7 @@ def test_two_processes_approving_at_once_act_once(client, db, clock):
 
     def approve_via(svc):
         barrier.wait()
-        return svc.approve(run["thread_id"], True, "alice", run["proposal"]["args_hash"])
+        return svc.approve(run["thread_id"], True, run["proposal"]["args_hash"], ALICE, allow)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(approve_via, [a, b]))
@@ -285,7 +300,7 @@ def test_crash_mid_write_recovers_without_a_second_rollback(client, db, clock, m
 
     monkeypatch.setattr(ar.InfraSimulator, "rollback", rollback_then_crash)
     with pytest.raises(SimulatedCrash):
-        serve.service().approve(run["thread_id"], True, "alice", run["proposal"]["args_hash"])
+        serve.service().approve(run["thread_id"], True, run["proposal"]["args_hash"], ALICE, allow)
     monkeypatch.setattr(ar.InfraSimulator, "rollback", real_rollback)
 
     restart(db, clock)
@@ -296,7 +311,7 @@ def test_crash_mid_write_recovers_without_a_second_rollback(client, db, clock, m
     assert len(stuck["side_effects"]) == 1  # the rollback did happen
 
     recovered = client.post(f"/runs/{run['thread_id']}/recover").json()
-    assert recovered["status"] == "completed" and recovered["approved_by"] == "alice"
+    assert recovered["status"] == "completed" and recovered["approved_by"] == ALICE
     assert recovered["outcome"].startswith("deduplicated: v2.14.3 -> v2.14.2")
     after = get(client, run)
     assert len(after["side_effects"]) == 1  # not rolled back twice
@@ -368,14 +383,14 @@ def test_crash_after_the_claim_before_resume_delivers_the_stored_decision(client
 
     monkeypatch.setattr(ar.RunHandle, "resume", crash)
     with pytest.raises(SimulatedCrash):
-        serve.service().approve(run["thread_id"], True, "alice", run["proposal"]["args_hash"])
+        serve.service().approve(run["thread_id"], True, run["proposal"]["args_hash"], ALICE, allow)
     monkeypatch.undo()
 
     restart(db, clock)
     clock.t += 301
     assert get(client, run)["status"] == "interrupted"
     recovered = client.post(f"/runs/{run['thread_id']}/recover").json()
-    assert recovered["status"] == "completed" and recovered["approved_by"] == "alice"
+    assert recovered["status"] == "completed" and recovered["approved_by"] == ALICE
     assert "v2.14.3 -> v2.14.2" in recovered["outcome"]
     assert len(side_effects(client, run)) == 1
     assert approve(client, run).json() == {**recovered, "replayed": True}
@@ -385,12 +400,13 @@ def test_crash_after_a_rejection_claim_delivers_the_rejection(client, db, clock,
     run = alert(client)
     monkeypatch.setattr(ar.RunHandle, "resume", lambda self, *a: (_ for _ in ()).throw(SimulatedCrash()))
     with pytest.raises(SimulatedCrash):
-        serve.service().approve(run["thread_id"], False, "sre-lead", run["proposal"]["args_hash"])
+        serve.service().approve(run["thread_id"], False, run["proposal"]["args_hash"], principal("sre-lead"), allow)
     monkeypatch.undo()
     restart(db, clock)
     clock.t += 301
     recovered = client.post(f"/runs/{run['thread_id']}/recover").json()
-    assert recovered["status"] == "escalated" and recovered["outcome"] == "Escalated to a human: rejected by sre-lead"
+    assert recovered["status"] == "escalated"
+    assert recovered["outcome"] == f"Escalated to a human: rejected by {principal('sre-lead')}"
     assert not side_effects(client, run)
 
 
@@ -433,7 +449,7 @@ def test_a_stalled_worker_that_wakes_up_after_recovery_is_fenced_out(client, db,
 
     def worker_a():
         try:
-            serve.service().approve(run["thread_id"], True, "alice", run["proposal"]["args_hash"])
+            serve.service().approve(run["thread_id"], True, run["proposal"]["args_hash"], ALICE, allow)
         except serve.ServiceError as e:
             a_result["error"] = (e.status_code, e.detail)
 
@@ -572,12 +588,12 @@ class RecordingTracer:
     def __init__(self):
         self.spans = []
 
-    def span(self, thread_id, name, input=None):
+    def span(self, thread_id, name, input=None, metadata=None):
         tracer = self
 
         class Span:
             def __init__(self):
-                self.record = {"trace": thread_id, "name": name, "input": input, "nodes": [],
+                self.record = {"trace": thread_id, "name": name, "input": input, "actor": metadata, "nodes": [],
                                "output": None, "metadata": None, "level": None, "trace_io": {}}
 
             def __enter__(self):
@@ -615,13 +631,13 @@ class RecordingTracer:
 def test_every_request_on_a_run_is_a_span_in_its_one_trace(db, clock, monkeypatch):
     tracer = RecordingTracer()
     serve.configure(db, clock=clock, approval_ttl_s=3600, retention_s=86400, lease_s=300, tracer=tracer)
-    client = TestClient(serve.app_fastapi)
+    client = http_client()
     run = alert(client)
 
     # Crash after the claim, then a new process recovers it: three requests, two processes.
     monkeypatch.setattr(ar.RunHandle, "resume", lambda self, *a: (_ for _ in ()).throw(SimulatedCrash()))
     with pytest.raises(SimulatedCrash):
-        serve.service().approve(run["thread_id"], True, "alice", run["proposal"]["args_hash"])
+        serve.service().approve(run["thread_id"], True, run["proposal"]["args_hash"], ALICE, allow)
     monkeypatch.undo()
     serve.configure(db, clock=clock, approval_ttl_s=3600, retention_s=86400, lease_s=300, tracer=tracer)
     clock.t += 301
@@ -649,13 +665,13 @@ def test_without_langfuse_there_is_no_tracing(client):
 def test_replays_and_rejected_approvals_are_traced_too(db, clock):
     tracer = RecordingTracer()
     serve.configure(db, clock=clock, approval_ttl_s=3600, retention_s=86400, lease_s=300, tracer=tracer)
-    client = TestClient(serve.app_fastapi)
+    client = http_client()
     run = alert(client)
     assert approve(client, run, args_hash="0" * 16).status_code == 409   # stale hash
     assert approve(client, run).status_code == 200                       # executes
     assert approve(client, run).json()["replayed"] is True               # same approver retries
     assert approve(client, run, approver="bob").status_code == 409       # another approver
-    assert client.post("/approve", json={"thread_id": "nope", "approved": True, "approver": "a",
+    assert client.post("/approve", json={"thread_id": "nope", "approved": True,
                                          "args_hash": "x"}).status_code == 404
     assert client.post(f"/runs/{run['thread_id']}/recover").status_code == 409  # not interrupted
 
@@ -666,8 +682,12 @@ def test_replays_and_rejected_approvals_are_traced_too(db, clock):
     stale, executed, replay, conflict, _ = spans
     assert stale["output"]["status_code"] == 409 and "args_hash" in stale["output"]["detail"]["error"]
     assert executed["output"]["replayed"] is False and executed["metadata"]["budget"]
-    assert replay["output"]["replayed"] is True and replay["input"]["approver"] == "alice"
-    assert conflict["output"]["detail"]["decided_by"] == "alice" and conflict["input"]["approver"] == "bob"
+    assert replay["output"]["replayed"] is True and replay["actor"]["actor_id"] == ALICE
+    assert conflict["output"]["detail"]["decided_by"] == ALICE and conflict["actor"]["actor_id"] == principal("bob")
+    # A span names its caller by principal id and scope only: no email, no groups, no token.
+    assert {tuple(sorted(s["actor"])) for s in tracer.spans} == {("actor_id", "scope")}
+    assert executed["actor"] == {"actor_id": ALICE, "scope": "runs:approve"}
+    assert executed["input"] == {"approved": True, "args_hash": run["proposal"]["args_hash"]}
     # Only the request that moved the run set the trace's output.
     assert [bool(s["trace_io"].get("output")) for s in spans] == [False, True, False, False, False]
 
@@ -675,7 +695,7 @@ def test_replays_and_rejected_approvals_are_traced_too(db, clock):
 def test_expired_approval_is_traced(db, clock):
     tracer = RecordingTracer()
     serve.configure(db, clock=clock, approval_ttl_s=3600, retention_s=86400, lease_s=300, tracer=tracer)
-    client = TestClient(serve.app_fastapi)
+    client = http_client()
     run = alert(client)
     clock.t += 3601
     assert approve(client, run).status_code == 410
