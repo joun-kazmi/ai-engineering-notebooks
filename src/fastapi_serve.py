@@ -4,23 +4,36 @@ Every alert runs the hardened graph from ai_engineering.agent_reliability:
 Pydantic tool contracts, timeouts and bounded retries, read-only
 investigation, evidence-checked actions, run budgets and an audit record per
 tool call. The service adds the parts that only exist when a human answers
-over HTTP, and keeps runs durable across restarts:
+over HTTP, and keeps runs durable across restarts. Every endpoint needs a
+Bearer token with its scope:
 
-  POST /alert                start a run; returns the proposal waiting at the
-                             approval gate (tool, validated args, args_hash,
-                             idempotency key), or the outcome if none is needed.
-  POST /approve              decide on that proposal. `args_hash` must name the
-                             proposal the approver reviewed, or it's a 409. The
-                             same approver resubmitting the same decision gets
-                             the stored result without anything acting again;
-                             a different decision, or another approver, is a
-                             409. A proposal left undecided past its TTL is
-                             410 Gone: its evidence is stale.
-  GET  /runs/{id}            status, outcome, budget, audit log, side effects.
-                             Never waits: a run being carried out reads as
-                             `executing`.
-  POST /runs/{id}/recover    continue a run whose process died mid-execution.
-  POST /generate             a plain chat completion (not the agent).
+  POST /alert                alerts:create. Start a run; returns the proposal
+                             waiting at the approval gate (tool, validated
+                             args, args_hash, idempotency key), or the outcome
+                             if none is needed.
+  POST /approve              runs:approve. Decide on that proposal. `args_hash`
+                             must name the proposal the approver reviewed, or
+                             it's a 409. The same approver resubmitting the
+                             same decision gets the stored result without
+                             anything acting again; a different decision, or
+                             another approver, is a 409. A proposal left
+                             undecided past its TTL is 410 Gone: its evidence
+                             is stale.
+  GET  /runs/{id}            runs:read. Status, outcome, budget, audit log,
+                             side effects. Never waits: a run being carried
+                             out reads as `executing`.
+  POST /runs/{id}/recover    runs:recover. Continue a run whose process died
+                             mid-execution.
+
+Authentication. The approver is whoever the token says, never the request
+body: the verified principal (`iss|sub`, ai_engineering.auth) is the
+decision's approver, so it's what replays and conflicts compare, what
+`approved_by` and the audit record name. A missing or invalid token is 401
+and a token without the endpoint's scope 403, before any run is touched or
+traced. Then the approval policy (by default: approving needs group `sre`,
+rejecting only the scope) is asked after the proposal checks and before the
+claim, so a refusal is a 403 that leaves the run waiting. AUTH_MODE=disabled
+serves every request as one local principal with every scope, for demos.
 
 Durability. Graph checkpoints are written by LangGraph's SqliteSaver, and the
 run store (ai_engineering.run_store) keeps each run's status, decision,
@@ -45,21 +58,28 @@ Tracing. With LANGFUSE_* set, each run is one Langfuse trace, and every
 request on it (alert, approve, recover) is a span inside it: executions hold
 their LangGraph node tree and LLM generations; replays and rejections
 (conflict, stale hash, expiry) are recorded too, rejections as WARNING,
-crashes as ERROR (LangfuseTracer). Requests for unknown runs aren't traced.
+crashes as ERROR (LangfuseTracer). Requests for unknown runs aren't traced,
+nor are requests refused for their token. A span names its caller only by
+principal id and the scope used — no email, no groups.
 
 Tools read a demo service catalog (each service's fixtures from the first
 incident about it in data/incident_eval_set.json) and write to a simulated
 backend, one per run, persisted with the run.
 """
+import logging
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, ConfigDict, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -67,7 +87,9 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from ai_engineering import agent_eval as ae
 from ai_engineering import agent_reliability as ar
-from ai_engineering.config import get_settings, make_chat_client
+from ai_engineering.auth import (ApprovalPolicy, AuthUnavailable, Forbidden, Identity, InvalidToken,
+                                  JwksKeyProvider, SreApprovalPolicy, TokenVerifier)
+from ai_engineering.config import get_settings
 from ai_engineering.run_store import FencedOut, RunStore
 from ai_engineering.tool_runtime import AuditLog, RunBudget, ToolExecutor
 
@@ -161,7 +183,7 @@ class FencedCheckpointer(SqliteSaver):
 class NullTracer:
     """No tracing (Langfuse not configured)."""
 
-    def span(self, thread_id: str, name: str, input=None):
+    def span(self, thread_id: str, name: str, input=None, metadata=None):
         return nullcontext(None)
 
     def callbacks(self) -> list:
@@ -185,9 +207,9 @@ class LangfuseTracer:
     def trace_id(self, thread_id: str) -> str:
         return self.lf.create_trace_id(seed=thread_id)
 
-    def span(self, thread_id: str, name: str, input=None):
+    def span(self, thread_id: str, name: str, input=None, metadata=None):
         return self.lf.start_as_current_observation(trace_context={"trace_id": self.trace_id(thread_id)},
-                                                    name=name, as_type="span", input=input)
+                                                    name=name, as_type="span", input=input, metadata=metadata)
 
     def callbacks(self) -> list:
         from langfuse.langchain import CallbackHandler
@@ -299,13 +321,14 @@ class Service:
     # ---- the API
 
     @contextmanager
-    def _traced(self, thread_id: str, name: str, request=None, trace_input=None):
-        """A span for this request in the run's trace. Yields `attach(run)`,
+    def _traced(self, thread_id: str, name: str, request=None, trace_input=None, actor: dict | None = None):
+        """A span for this request in the run's trace, with `actor` (who made
+        the request: actor_id and the scope used) as its metadata. Yields `attach(run)`,
         which puts the run's LangGraph node tree under the span, and
         `record(result, run=None)`, which records what the request returned.
         A rejected request (ServiceError) is recorded as a WARNING with its
         status code; anything else that escapes, as an ERROR."""
-        with self.tracer.span(thread_id, name, input=request) as span:
+        with self.tracer.span(thread_id, name, input=request, metadata=actor) as span:
             def attach(run: ar.RunHandle) -> ar.RunHandle:
                 run.config["callbacks"] = self.tracer.callbacks()
                 return run
@@ -337,12 +360,12 @@ class Service:
                                            "the run marked interrupted or recovered elsewhere)",
                                   "thread_id": thread_id})
 
-    def alert(self, alert_text: str) -> dict:
+    def alert(self, alert_text: str, actor: dict | None = None) -> dict:
         self.housekeeping()
         thread_id = str(uuid.uuid4())
         self.store.create(thread_id, alert_text, self.clock())  # epoch 1
-        with self._traced(thread_id, "served:alert", {"alert": alert_text}, trace_input={"alert": alert_text}) \
-                as (attach, record):
+        with self._traced(thread_id, "served:alert", {"alert": alert_text}, trace_input={"alert": alert_text},
+                          actor=actor) as (attach, record):
             try:
                 run = attach(self._open(thread_id, alert_text, epoch=1))
                 run.start()
@@ -350,19 +373,25 @@ class Service:
             except FencedOut:
                 raise self._taken_over(thread_id) from None
 
-    def approve(self, thread_id: str, approved: bool, approver: str, args_hash: str) -> dict:
+    def approve(self, thread_id: str, approved: bool, args_hash: str, principal_id: str, authorize,
+                actor: dict | None = None) -> dict:
+        """Decide on the run's pending proposal as `principal_id`, a verified
+        identity. `authorize(proposal, approved)` is the approval policy for
+        that identity: it raises auth.Forbidden to refuse, and is asked only
+        once the proposal checks pass, before the run is claimed."""
         row = self._row(thread_id)  # unknown runs: 404, no span (no trace for made-up ids)
-        decision = {"approved": approved, "args_hash": args_hash, "approver": approver}
+        decision = {"approved": approved, "args_hash": args_hash, "approver": principal_id}
         # Every approval request on a run is a span in its trace — replays,
-        # conflicts, stale hashes and expiries included: at an approval
-        # boundary, five retries or another approver's conflict are evidence.
-        with self._traced(thread_id, "served:approve", request=decision) as (attach, record):
+        # conflicts, stale hashes, expiries and policy refusals included: at
+        # an approval boundary, five retries or another approver's conflict
+        # are evidence.
+        with self._traced(thread_id, "served:approve", request={"approved": approved, "args_hash": args_hash},
+                          actor=actor or {"actor_id": principal_id}) as (attach, record):
             for _ in range(2):  # a lost claim re-reads once: the winner's decision is stored by then
                 if row["decision"] is not None:
-                    # A replay is the same approver resubmitting the same decision on
+                    # A replay is the same principal resubmitting the same decision on
                     # the same proposal (double click, client retry): same answer, no
-                    # second action. `approver` is caller-supplied for now; once there's
-                    # auth it should come from the authenticated identity.
+                    # second action.
                     if row["decision"] != decision:
                         raise ServiceError(409, {"error": "This run was already decided",
                                                  "decided_by": row["decision"]["approver"],
@@ -376,6 +405,10 @@ class Service:
                 if args_hash != row["proposal"]["args_hash"]:
                     raise ServiceError(409, {"error": "args_hash does not match the pending proposal; "
                                                       "review it and approve that one", "proposal": row["proposal"]})
+                try:
+                    authorize(row["proposal"], approved)
+                except Forbidden as e:
+                    raise ServiceError(403, {"error": str(e)}) from None
                 # Claim it. Across threads and processes, exactly one request wins.
                 epoch = self.store.claim(thread_id, "awaiting_approval", "executing", self.clock(),
                                          decision=decision)
@@ -386,12 +419,12 @@ class Service:
                 raise ServiceError(409, "Another request is deciding this run")
             try:
                 run = attach(self._open(thread_id, row["alert"], epoch, self.store.get(thread_id)))
-                run.resume(approved, approver)
+                run.resume(approved, principal_id)
                 return record({**self._settle(thread_id, run, epoch, "executing", decision), "replayed": False}, run)
             except FencedOut:
                 raise self._taken_over(thread_id) from None
 
-    def recover(self, thread_id: str) -> dict:
+    def recover(self, thread_id: str, actor: dict | None = None) -> dict:
         """Continue an interrupted run. Where to continue from depends on how
         far it got before its process died, which the stored decision and
         the graph checkpoint tell together:
@@ -408,7 +441,7 @@ class Service:
                                       same idempotency key and deduplicated
         """
         row = self._row(thread_id)
-        with self._traced(thread_id, "served:recover") as (attach, record):
+        with self._traced(thread_id, "served:recover", actor=actor) as (attach, record):
             if row["status"] != "interrupted":
                 raise ServiceError(409, f"Only an interrupted run can be recovered; this one is {row['status']}")
             resuming = "executing" if row["decision"] else "starting"
@@ -457,73 +490,167 @@ def service() -> Service:
 
 
 # ══════════════════════════════════════════════════════════
-# 3. FASTAPI
+# 3. AUTHENTICATION
+# ══════════════════════════════════════════════════════════
+log = logging.getLogger(__name__)
+
+SCOPES = frozenset({"alerts:create", "runs:read", "runs:approve", "runs:recover"})
+LOCAL_PRINCIPAL = "local|demo"
+
+
+class AuthNotConfigured(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class AuthConfig:
+    mode: str                           # "oidc" or "disabled"
+    verifier: TokenVerifier | None      # None when disabled
+    policy: ApprovalPolicy
+    local_identity: Identity | None = None
+
+
+_auth: AuthConfig | None = None
+_auth_lock = threading.Lock()
+
+
+def configure_auth(verifier: TokenVerifier | None = None, policy: ApprovalPolicy | None = None,
+                   mode: str | None = None) -> AuthConfig:
+    """(Re)create the auth config: a given verifier and policy (tests), or
+    one built from AUTH_* settings. With AUTH_MODE=oidc (the default) a
+    missing issuer, audience or JWKS URL raises, and every request is refused
+    until it's fixed."""
+    global _auth
+    s = get_settings()
+    mode = mode or ("oidc" if verifier is not None else s.auth_mode)
+    policy = policy or SreApprovalPolicy(s.auth_approver_group)
+    if mode == "disabled":
+        log.warning("AUTH_MODE=disabled: authentication is OFF. Every request is %r with every scope "
+                    "and group %r. Use only for local demos.", LOCAL_PRINCIPAL, s.auth_approver_group)
+        _auth = AuthConfig(mode, None, policy, Identity(LOCAL_PRINCIPAL, SCOPES,
+                                                        frozenset({s.auth_approver_group})))
+        return _auth
+    if mode != "oidc":
+        raise AuthNotConfigured(f"unknown AUTH_MODE {mode!r}")
+    if verifier is None:
+        missing = [name for name, value in (("AUTH_ISSUER", s.auth_issuer), ("AUTH_AUDIENCE", s.auth_audience),
+                                            ("AUTH_JWKS_URL", s.auth_jwks_url)) if not value]
+        if missing:
+            raise AuthNotConfigured(f"AUTH_MODE=oidc needs {', '.join(missing)} "
+                                    "(or AUTH_MODE=disabled for a local demo)")
+        verifier = TokenVerifier(s.auth_issuer, s.auth_audience, JwksKeyProvider(s.auth_jwks_url),
+                                 algorithms=s.resolved_auth_algorithms, scope_claim=s.auth_scope_claim,
+                                 groups_claim=s.auth_groups_claim)
+    _auth = AuthConfig(mode, verifier, policy)
+    return _auth
+
+
+def reset_auth() -> None:
+    """Forget the auth config; the next request builds it from settings."""
+    global _auth
+    _auth = None
+
+
+def auth_config() -> AuthConfig:
+    with _auth_lock:
+        return _auth or configure_auth()
+
+
+@dataclass(frozen=True)
+class Caller:
+    identity: Identity
+    scope: str
+
+    @property
+    def actor(self) -> dict:
+        """What a span records about the caller: no email, no groups."""
+        return {"actor_id": self.identity.principal_id, "scope": self.scope}
+
+
+_bearer = HTTPBearer(auto_error=False)
+
+
+def _unauthorized(detail: str) -> HTTPException:
+    return HTTPException(status_code=401, detail=detail, headers={"WWW-Authenticate": "Bearer"})
+
+
+def require(scope: str):
+    """A dependency: the verified caller, who must hold `scope`. Refusals
+    here happen before any run is read or traced."""
+    def dependency(credentials: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> Caller:
+        try:
+            auth = auth_config()
+        except AuthNotConfigured as e:
+            log.error("refusing request: %s", e)
+            raise HTTPException(status_code=503, detail="Authentication is not configured") from None
+        if auth.verifier is None:
+            identity = auth.local_identity
+        elif credentials is None:
+            raise _unauthorized("Missing bearer token")
+        else:
+            try:
+                identity = auth.verifier.verify(credentials.credentials)
+            except InvalidToken as e:
+                log.info("rejected token: %s", e)
+                raise _unauthorized("Invalid token") from None
+            except AuthUnavailable as e:
+                log.error("cannot verify tokens: %s", e)
+                raise HTTPException(status_code=503, detail="Token verification unavailable") from None
+        if scope not in identity.scopes:
+            raise HTTPException(status_code=403, detail=f"Token lacks scope {scope}")
+        return Caller(identity, scope)
+
+    return dependency
+
+
+# ══════════════════════════════════════════════════════════
+# 4. FASTAPI
 # ══════════════════════════════════════════════════════════
 app_fastapi = FastAPI(title="Escalation Agent API")
 
 
 class AlertPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     alert_text: str = Field(min_length=1, max_length=2000)
 
 
 class ApprovalPayload(BaseModel):
+    # No `approver`: it's the token's principal. A client still sending one
+    # gets a 422 rather than believing it was used.
+    model_config = ConfigDict(extra="forbid")
+
     thread_id: str
     approved: bool
-    approver: str = Field(min_length=1, max_length=100)
     # The proposal the approver reviewed. Binds the decision to exact
     # arguments: approving an earlier or different proposal is refused.
     args_hash: str = Field(min_length=1)
 
 
-class GenerateRequest(BaseModel):
-    prompt: str
-
-
-def _call(fn, *args):
+def _call(fn, *args, **kwargs):
     try:
-        return fn(*args)
+        return fn(*args, **kwargs)
     except ServiceError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
 
 @app_fastapi.post("/alert")
-def receive_alert(payload: AlertPayload):
-    return _call(service().alert, payload.alert_text)
+def receive_alert(payload: AlertPayload, caller: Caller = Depends(require("alerts:create"))):
+    return _call(service().alert, payload.alert_text, actor=caller.actor)
 
 
 @app_fastapi.post("/approve")
-def approve_action(payload: ApprovalPayload):
-    return _call(service().approve, payload.thread_id, payload.approved, payload.approver, payload.args_hash)
+def approve_action(payload: ApprovalPayload, caller: Caller = Depends(require("runs:approve"))):
+    authorize = partial(auth_config().policy.authorize, caller.identity)
+    return _call(service().approve, payload.thread_id, payload.approved, payload.args_hash,
+                 caller.identity.principal_id, authorize, actor=caller.actor)
 
 
 @app_fastapi.get("/runs/{thread_id}")
-def get_run(thread_id: str):
+def get_run(thread_id: str, caller: Caller = Depends(require("runs:read"))):
     return _call(service().get, thread_id)
 
 
 @app_fastapi.post("/runs/{thread_id}/recover")
-def recover_run(thread_id: str):
-    return _call(service().recover, thread_id)
-
-
-_llm_client = None
-
-
-@app_fastapi.post("/generate")
-def generate(req: GenerateRequest):
-    # Created on first use, so the service starts (and serves the agent in
-    # offline mode) without an API key.
-    global _llm_client
-    settings = get_settings()
-    if not settings.has_llm_credentials:
-        raise HTTPException(status_code=503, detail="No API key configured for LLM_PROVIDER")
-    if _llm_client is None:
-        _llm_client = make_chat_client(settings)
-    response = _llm_client.chat.completions.create(
-        model=settings.resolved_model,
-        extra_body=settings.adapter.chat_extra_body(),
-        messages=[{"role": "user", "content": req.prompt}],
-        max_tokens=200,
-        temperature=0.3,
-    )
-    return {"response": response.choices[0].message.content}
+def recover_run(thread_id: str, caller: Caller = Depends(require("runs:recover"))):
+    return _call(service().recover, thread_id, actor=caller.actor)

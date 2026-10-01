@@ -77,7 +77,7 @@ Multi-step agents on LangGraph, using incident response and support triage as th
 
 | File | What it covers |
 |---|---|
-| [`src/fastapi_serve.py`](src/fastapi_serve.py) | The hardened escalation agent served over FastAPI. `/alert` returns the proposal waiting at the approval gate. `/approve` must name that proposal's `args_hash`, and a repeated submit replays the stored result instead of acting twice. `/runs/{id}` returns the budget, the audit log and the Langfuse trace. Runs are stored in SQLite: a pending approval survives a restart, an approval is claimed atomically across processes, and a run whose process crashed can be recovered without repeating a write it already made. |
+| [`src/fastapi_serve.py`](src/fastapi_serve.py) | The hardened escalation agent served over FastAPI, behind Bearer-token (OIDC JWT) authentication with a scope per endpoint. `/alert` returns the proposal waiting at the approval gate. `/approve` must name that proposal's `args_hash`; the approver is the token's verified principal, never the request body, and approving a write needs the `sre` group. A repeated submit replays the stored result instead of acting twice. `/runs/{id}` returns the budget, the audit log and the Langfuse trace. Runs are stored in SQLite: a pending approval survives a restart, an approval is claimed atomically across processes, and a run whose process crashed can be recovered without repeating a write it already made. |
 
 ---
 
@@ -217,10 +217,10 @@ python scripts/agent_observability_eval.py
 python scripts/agent_reliability_hardening.py
 ```
 
-To run the FastAPI service (from the repo root):
+To run the FastAPI service (from the repo root) as a local demo, with authentication off:
 
 ```bash
-uvicorn src.fastapi_serve:app_fastapi --reload
+AUTH_MODE=disabled uvicorn src.fastapi_serve:app_fastapi --reload
 ```
 
 `app_fastapi` is the FastAPI instance. `app` in the same module is the graph's structure, for introspection; each alert gets its own compiled copy, bound to that run's budget, executor and audit log. Without an API key the agent runs offline, with rule-based stand-ins. Its tools read a demo catalog built from `data/incident_eval_set.json` and write to an in-memory simulator.
@@ -232,8 +232,47 @@ curl -s -X POST localhost:8000/alert -H 'content-type: application/json' \
 #     "args": {"team": "db-team", ...}, "args_hash": "fd788be9149bbff0", ...}, ...}
 
 curl -s -X POST localhost:8000/approve -H 'content-type: application/json' \
-  -d '{"thread_id": "...", "approved": true, "approver": "alice", "args_hash": "fd788be9149bbff0"}'
+  -d '{"thread_id": "...", "approved": true, "args_hash": "fd788be9149bbff0"}'
+# -> {"status": "completed", "approved_by": "local|demo", ...}
 ```
+
+With authentication on, add `-H "Authorization: Bearer $TOKEN"` to each request.
+
+The endpoints:
+
+| Endpoint | Scope | |
+|---|---|---|
+| `POST /alert` | `alerts:create` | Start a run. Returns the proposal waiting at the gate, or the outcome if none is needed. |
+| `POST /approve` | `runs:approve` | `{thread_id, approved, args_hash}`: decide on that proposal. |
+| `GET /runs/{id}` | `runs:read` | Status, outcome, budget, audit log, side effects, trace URL. |
+| `POST /runs/{id}/recover` | `runs:recover` | Continue a run whose process died. |
+
+### Authentication
+
+Every request needs a Bearer JWT from your OIDC provider (`src/ai_engineering/auth.py`). It's verified against `AUTH_ISSUER` and `AUTH_AUDIENCE` with the issuer's published keys (`AUTH_JWKS_URL`, cached by PyJWT's `PyJWKClient`), and it must carry `exp`, `iss`, `aud` and `sub`. The algorithm comes from `AUTH_ALGORITHMS` (default `RS256,ES256`), never from the token; HMAC and `none` can't be configured. A missing or invalid token is `401`, and a valid one without the endpoint's scope is `403`. Neither touches or traces a run.
+
+- **Who.** The caller is `principal_id = "{iss}|{sub}"`: the subject is stable and unique only within its issuer. It's never the email, which can change or be reassigned. The principal is the decision's approver. Replays and conflicts compare it, and `approved_by`, the stored decision and the audit record name it. The request body has no `approver` field: sending one is a `422`.
+- **Scopes and groups.** These are read from `AUTH_SCOPE_CLAIM` (default `scope`) and `AUTH_GROUPS_CLAIM` (default `groups`), as a space-delimited string or a list. Entra ID, for instance, uses `scp` and `roles`.
+- **The approval policy.** Approving a write also needs the `AUTH_APPROVER_GROUP` group (default `sre`). Rejecting needs only `runs:approve`: a rejection takes no action, and the run escalates to a human. The policy is checked after the proposal and `args_hash` checks and before the run is claimed. So a refusal is a `403` that leaves the run waiting, recorded in its trace as a `WARNING` span.
+- **Traces** name the caller only by `actor_id` (the principal) and the scope used: no email, no groups.
+- **Configuration.** `AUTH_MODE=oidc` is the default. Without the issuer, audience and JWKS URL, every request is refused (`503`); the service doesn't fall back to open. `AUTH_MODE=disabled` is for local demos only. Every request is the principal `local|demo`, with every scope and the approver group, and the service logs a warning saying so.
+
+Separation of duties: a production deployment may additionally require four-eyes approval (a second, different approver) for writes. This service doesn't.
+
+### Production integration contract
+
+The tools here write to a simulator. A real write backend must honor per-run fencing, because a stalled worker can wake up after its run was recovered elsewhere:
+
+- **The request** carries `run_id`, `fencing_epoch`, `idempotency_key`, the operation and its args.
+- **Atomically with the side effect,** the backend loads the highest epoch it has accepted for that `run_id`:
+  - a lower epoch is rejected;
+  - an equal epoch is allowed;
+  - a higher epoch advances the stored value;
+  - and the idempotency key is deduplicated, so a re-sent write returns the original result.
+
+This stops a stale worker of the same run. It does **not** serialize two different runs changing the same resource. That needs the backend's own optimistic concurrency or resource preconditions (an `If-Match` ETag, "roll back only if the current version is v2.14.3").
+
+`ToolContext` doesn't carry a fencing token yet. It gets one when a real adapter consumes it.
 
 Runs are durable. LangGraph's `SqliteSaver` stores the graph checkpoints. A run store in the same file (`SERVE_DB_PATH`, default `.data/serve.sqlite3`) keeps each run's status, decision, budget, idempotency ledger, circuit-breaker counts, simulated backend and audit log, and writes each one as it changes. As a result:
 
@@ -245,15 +284,15 @@ Runs are durable. LangGraph's `SqliteSaver` stores the graph checkpoints. A run 
   - **Approval claimed but not delivered:** the stored decision is delivered.
   - **Back at the gate:** it waits for approval again.
   - **Anywhere else:** it continues from the last checkpoint. A write it had already made is re-sent with the same idempotency key and deduplicated, so nothing happens twice.
-- **A worker presumed dead can't overwrite a recovered run.** Every claim, recovery and stale-marking bumps the run's epoch, and every write requires the current epoch. That covers run state, audit records and LangGraph checkpoints. A stalled worker that wakes up after its run was recovered fails on its next write and stops. (With a real backend, the epoch would also be sent to it as a fencing token.)
+- **A worker presumed dead can't overwrite a recovered run.** Every claim, recovery and stale-marking bumps the run's epoch, and every write requires the current epoch. That covers run state, audit records and LangGraph checkpoints. A stalled worker that wakes up after its run was recovered fails on its next write and stops. (With a real backend, the epoch is also sent to it as a fencing token: see the [production integration contract](#production-integration-contract).)
 - **Checkpoints are written synchronously** (`durability="sync"`), so a crash can't lose a finished step. They are also **deserialized strictly**, so a tampered database can't make the service construct arbitrary Python objects.
 - **A hung tool can't take the others down.** Each tool has its own concurrency slots (`ToolSpec.max_concurrency`, default 4), shared by all runs in the process. Configuring the same tool with a different limit elsewhere is an error rather than silently getting the first limit. A timed-out call keeps its slot until it actually returns. So a tool that hangs forever ties up at most its own slots, and the next call to it fails fast as `saturated`: it doesn't run, isn't charged, and counts toward the circuit breaker. Every other tool keeps working. LLM calls have their own slots (32 by default); saturation there is retried with backoff, within the run's budget.
 - **One Langfuse trace per run.** With `LANGFUSE_*` set, the trace id is derived from the run's `thread_id`. So every `/alert`, `/approve` and `/recover` request on a run adds a span to the same trace, even from different processes:
   - requests that execute hold their LangGraph node tree and LLM generations;
   - replays are recorded with their result;
-  - rejections (another approver, a stale `args_hash`, an expired proposal, a run with nothing to recover) are recorded as `WARNING`, and crashes as `ERROR`.
+  - rejections (another approver, a stale `args_hash`, an expired proposal, an approval policy refusal, a run with nothing to recover) are recorded as `WARNING`, and crashes as `ERROR`.
 
-  Requests for unknown runs aren't traced. `GET /runs/{id}` returns the `trace_url`.
+  Requests for unknown runs aren't traced, and neither are requests refused for their token. `GET /runs/{id}` returns the `trace_url`.
 
 To run the offline smoke tests (no API keys or LLM calls; the same suite runs in CI):
 
