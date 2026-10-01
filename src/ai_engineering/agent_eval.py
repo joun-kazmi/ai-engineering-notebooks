@@ -260,7 +260,7 @@ DECOY_FIXTURES = {
     "deploys": [{"version": "v9.1.0", "minutes_ago": 12, "author": "sam"}],
     "metrics": {"error_rate": 0.27, "p95_latency_ms": 3900, "slo_p95_ms": 1000, "replicas_healthy": "4/4",
                 "replicas": [{"name": f"replica-{i}", "healthy": True} for i in range(1, 5)]},
-    "dependencies": [{"name": "postgres-replica-3", "owner": "db-team", "status": "healthy"}],
+    "dependencies": [{"name": "postgres-replica-3", "owner": "db-team", "health": "healthy", "status": "healthy"}],
 }
 
 

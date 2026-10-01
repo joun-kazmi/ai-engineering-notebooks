@@ -55,11 +55,13 @@
         {
           "name": "postgres-primary",
           "owner": "db-team",
+          "health": "healthy",
           "status": "healthy"
         },
         {
           "name": "card-gateway",
           "owner": "partner-integrations",
+          "health": "healthy",
           "status": "healthy"
         }
       ]
@@ -128,6 +130,7 @@
         {
           "name": "postgres-primary",
           "owner": "db-team",
+          "health": "saturated",
           "status": "saturated: 100% CPU, 480 active queries"
         }
       ]
@@ -225,6 +228,7 @@
         {
           "name": "postgres-primary",
           "owner": "db-team",
+          "health": "healthy",
           "status": "healthy"
         }
       ]
@@ -279,6 +283,7 @@
         {
           "name": "smtp-relay",
           "owner": "infra-team",
+          "health": "healthy",
           "status": "healthy"
         }
       ]
@@ -335,6 +340,7 @@
         {
           "name": "elasticsearch",
           "owner": "search-team",
+          "health": "healthy",
           "status": "healthy"
         }
       ]
@@ -440,11 +446,13 @@
         {
           "name": "postgres-primary",
           "owner": "db-team",
+          "health": "healthy",
           "status": "healthy"
         },
         {
           "name": "card-gateway",
           "owner": "partner-integrations",
+          "health": "degraded",
           "status": "degraded: 503s since 14:05"
         }
       ]
